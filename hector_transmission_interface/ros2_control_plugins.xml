@@ -1,0 +1,10 @@
+<library path="transmission_interface">
+    <!-- Transmission types -->
+    <class name="transmission_interface/DynamicOffsetTransmission"
+           type="transmission_interface::DynamicOffsetTransmissionLoader"
+           base_class_type="transmission_interface::TransmissionLoader">
+        <description>
+            Load configuration of a dynamic offset transmission from a URDF description.
+        </description>
+    </class>
+</library>
