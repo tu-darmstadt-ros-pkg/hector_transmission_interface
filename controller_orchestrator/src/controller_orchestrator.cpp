@@ -12,7 +12,7 @@ namespace controller_orchestrator
 using ListControllers = controller_manager_msgs::srv::ListControllers;
 using SwitchController = controller_manager_msgs::srv::SwitchController;
 
-ControllerOrchestrator::ControllerOrchestrator( rclcpp::Node::SharedPtr node,
+ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &node,
                                                 const std::string &controller_manager_name )
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
@@ -23,10 +23,14 @@ ControllerOrchestrator::ControllerOrchestrator( rclcpp::Node::SharedPtr node,
   switch_controller_client_ =
       node_->create_client<SwitchController>( controller_manager_name_ + "/switch_controller",
                                               rmw_qos_profile_services_default, callback_group_ );
+  list_hardware_components_client_ =
+      node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
+          controller_manager_name_ + "/list_hardware_components", rmw_qos_profile_services_default,
+          callback_group_ );
 }
 
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
-                                                    int timeout_s )
+                                                    int timeout_s ) const
 {
   // 1) Wait for and call "list_controllers" to retrieve all controllers’ states
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
@@ -153,14 +157,174 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   }
   auto switch_resp = switch_future.get();
   if ( !switch_resp || !switch_resp->ok ) {
-    RCLCPP_ERROR( node_->get_logger(), "switch_controller service returned ok=false%s",
-                  ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
+    RCLCPP_ERROR_STREAM(
+        node_->get_logger(),
+        "switch_controller service returned ok=false%s"
+            << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
     return false;
   }
 
   RCLCPP_INFO( node_->get_logger(),
                "Successfully switched controllers. Activated [%zu], deactivated [%zu].",
                to_activate.size(), to_deactivate.size() );
+  return true;
+}
+
+std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareInterface(
+    const std::string &hardware_interface, int timeout_s ) const
+{
+  // 1) Wait for and call "list_hardware_components"
+  if ( !list_hardware_components_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
+    RCLCPP_ERROR(
+        node_->get_logger(), "getActiveControllerOfHardwareInterface: list_hardware_components service not available after %d s",
+        timeout_s );
+    return {};
+  }
+  auto hw_req = std::make_shared<ListHardwareComponents::Request>();
+  RCLCPP_INFO( node_->get_logger(),
+               "getActiveControllerOfHardwareInterface: calling %s/list_hardware_components...",
+               controller_manager_name_.c_str() );
+  auto hw_future = list_hardware_components_client_->async_send_request( hw_req );
+
+  if ( hw_future.wait_for( std::chrono::seconds( timeout_s ) ) == std::future_status::timeout ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "getActiveControllerOfHardwareInterface: list_hardware_components call timed out (>%d s)",
+        timeout_s );
+    return {};
+  }
+  auto hw_resp = hw_future.get();
+  if ( !hw_resp ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "getActiveControllerOfHardwareInterface: list_hardware_components returned null" );
+    return {};
+  }
+
+  // 2) Find the component matching hardware_interface and collect its command interfaces
+  std::unordered_set<std::string> target_command_interfaces;
+  bool found_component = false;
+  for ( const auto &comp : hw_resp->component ) {
+    if ( comp.name == hardware_interface ) {
+      found_component = true;
+      for ( const auto &hw_if : comp.command_interfaces ) {
+        target_command_interfaces.insert( hw_if.name );
+      }
+      break;
+    }
+  }
+  if ( !found_component ) {
+    RCLCPP_WARN( node_->get_logger(),
+                 "getActiveControllerOfHardwareInterface: hardware component '%s' not found",
+                 hardware_interface.c_str() );
+    return {};
+  }
+  if ( target_command_interfaces.empty() ) {
+    RCLCPP_INFO( node_->get_logger(),
+                 "getActiveControllerOfHardwareInterface: hardware '%s' has no command interfaces",
+                 hardware_interface.c_str() );
+    return {};
+  }
+
+  // 3) Wait for and call "list_controllers"
+  if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "getActiveControllerOfHardwareInterface: list_controllers service not available after %d s",
+        timeout_s );
+    return {};
+  }
+  auto list_req = std::make_shared<ListControllers::Request>();
+  RCLCPP_INFO( node_->get_logger(),
+               "getActiveControllerOfHardwareInterface: calling %s/list_controllers...",
+               controller_manager_name_.c_str() );
+  auto list_future = list_controllers_client_->async_send_request( list_req );
+
+  if ( list_future.wait_for( std::chrono::seconds( timeout_s ) ) == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "getActiveControllerOfHardwareInterface: list_controllers call timed out (>%d s)",
+                  timeout_s );
+    return {};
+  }
+  auto list_resp = list_future.get();
+  if ( !list_resp ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "getActiveControllerOfHardwareInterface: list_controllers returned null" );
+    return {};
+  }
+
+  // 4) Iterate through each controller; if active and any claimed_interface ∈ target_command_interfaces,
+  //    add its name to the result.
+  std::vector<std::string> active_controllers;
+  for ( const auto &ctrl : list_resp->controller ) {
+    if ( ctrl.state != "active" ) {
+      continue;
+    }
+    for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
+      if ( target_command_interfaces.count( claimed_if ) > 0 ) {
+        active_controllers.push_back( ctrl.name );
+        break;
+      }
+    }
+  }
+
+  return active_controllers;
+}
+bool ControllerOrchestrator::deactivateControllers(
+    const std::vector<std::string> &controllers_to_deactivate, int timeout_s ) const
+{
+  auto switch_req = std::make_shared<SwitchController::Request>();
+  switch_req->deactivate_controllers = controllers_to_deactivate;
+  switch_req->strictness = SwitchController::Request::BEST_EFFORT;
+  switch_req->activate_asap = false;
+  switch_req->timeout.sec = 0; // zero = infinite
+  switch_req->timeout.nanosec = 0u;
+
+  auto switch_future = switch_controller_client_->async_send_request( switch_req );
+
+  // Block until either the future is ready or we exceed timeout_s
+  auto switch_status = switch_future.wait_for( std::chrono::seconds( timeout_s ) );
+  if ( switch_status == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(), "switch_controller service call timed out (>%d s)", timeout_s );
+    return false;
+  }
+  auto switch_resp = switch_future.get();
+  if ( !switch_resp || !switch_resp->ok ) {
+    RCLCPP_ERROR_STREAM(
+        node_->get_logger(),
+        "switch_controller service returned ok=false%s"
+            << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
+    return false;
+  }
+  return true;
+}
+
+bool ControllerOrchestrator::activateControllers(
+    const std::vector<std::string> &controllers_to_activate, int timeout_s ) const
+{
+  auto switch_req = std::make_shared<SwitchController::Request>();
+  switch_req->activate_controllers = controllers_to_activate;
+  switch_req->strictness = SwitchController::Request::BEST_EFFORT;
+  switch_req->activate_asap = false;
+  switch_req->timeout.sec = 0; // zero = infinite
+  switch_req->timeout.nanosec = 0u;
+
+  auto switch_future = switch_controller_client_->async_send_request( switch_req );
+
+  // Block until either the future is ready or we exceed timeout_s
+  auto switch_status = switch_future.wait_for( std::chrono::seconds( timeout_s ) );
+  if ( switch_status == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(), "switch_controller service call timed out (>%d s)", timeout_s );
+    return false;
+  }
+  auto switch_resp = switch_future.get();
+  if ( !switch_resp || !switch_resp->ok ) {
+    RCLCPP_ERROR_STREAM(
+        node_->get_logger(),
+        "switch_controller service returned ok=false%s"
+            << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
+    return false;
+  }
   return true;
 }
 

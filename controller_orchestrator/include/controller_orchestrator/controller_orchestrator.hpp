@@ -4,6 +4,7 @@
 #include <memory>
 
 #include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -14,10 +15,11 @@ class ControllerOrchestrator
 {
   using ListControllers = controller_manager_msgs::srv::ListControllers;
   using SwitchController = controller_manager_msgs::srv::SwitchController;
+  using ListHardwareComponents = controller_manager_msgs::srv::ListHardwareComponents;
 
 public:
   explicit ControllerOrchestrator(
-      rclcpp::Node::SharedPtr node,
+      const rclcpp::Node::SharedPtr &node,
       const std::string &controller_manager_name = "controller_manager" );
 
   /**
@@ -30,7 +32,21 @@ public:
    * of the controllers to be activated is already active.
    * @return
    */
-  bool smartSwitchController( std::vector<std::string> &activate_controllers, int timeout_s = 2 );
+  bool smartSwitchController( std::vector<std::string> &activate_controllers,
+                              int timeout_s = 2 ) const;
+
+  std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
+                                                                   int timeout_s = 2 ) const;
+
+  bool deactivateControllers( const std::vector<std::string> &controllers_to_deactivate,
+                              int timeout_s = 2 ) const;
+
+  bool activateControllers( const std::vector<std::string> &controllers_to_activate,
+                            int timeout_s = 2 ) const;
+
+  bool activateControllersOfHardwareInterface( const std::string &hardware_interface,
+                                               const std::vector<std::string> &controllers_to_activate,
+                                               int timeout_s = 2 );
 
 private:
   rclcpp::Node::SharedPtr node_;
@@ -38,6 +54,8 @@ private:
   std::string controller_manager_name_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_client_;
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_client_;
+  rclcpp::Client<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
+      list_hardware_components_client_;
 };
 
 } // namespace controller_orchestrator

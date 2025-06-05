@@ -45,6 +45,20 @@ int main( int argc, char **argv )
           RCLCPP_ERROR( node->get_logger(),
                         "[Test] smartSwitchController returned false (switch failed)" );
         }
+        // deactivate controllers of athena_flipper_interface
+        auto to_deactivate =
+            orchestrator->getActiveControllerOfHardwareInterface( "athena_flipper_interface", 10 );
+        // print the controllers to deactivate
+        RCLCPP_INFO( node->get_logger(), "[Test] Controllers to deactivate: [%zu]",
+                     to_deactivate.size() );
+        for ( const auto &controller : to_deactivate ) {
+          RCLCPP_INFO( node->get_logger(), "  - %s", controller.c_str() );
+        }
+        if ( !orchestrator->deactivateControllers( to_deactivate, 10 ) ) {
+          RCLCPP_ERROR( node->get_logger(), "[Test] Failed to deactivate controllers" );
+        } else {
+          RCLCPP_INFO( node->get_logger(), "[Test] Successfully deactivated controllers" );
+        }
       } );
 
   // 5) Create a MultiThreadedExecutor with at least 2 threads.
