@@ -47,6 +47,7 @@ public:
   bool activateControllersOfHardwareInterface( const std::string &hardware_interface,
                                                const std::vector<std::string> &controllers_to_activate,
                                                int timeout_s = 2 );
+  bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 2 );
 
 private:
   rclcpp::Node::SharedPtr node_;

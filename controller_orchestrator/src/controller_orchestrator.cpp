@@ -328,4 +328,47 @@ bool ControllerOrchestrator::activateControllers(
   return true;
 }
 
+bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_name, int timeout_s )
+{
+  // Step 1: Request list of controllers
+  auto list_request = std::make_shared<ListControllers::Request>();
+  auto list_future = list_controllers_client_->async_send_request( list_request );
+  auto list_status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
+
+  if ( list_status == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(), "list_controllers service call timed out (>%d s)", timeout_s );
+    return false;
+  }
+
+  auto list_resp = list_future.get();
+  std::vector<std::string> controllers_to_deactivate;
+
+  // Step 2: Iterate through active controllers and check if they claim the joint
+  for ( const auto &ctrl : list_resp->controller ) {
+    if ( ctrl.state == "active" ) {
+      for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
+        // Example claimed interface: "joint1/position", "joint2/velocity"
+        const auto sep_pos = claimed_if.find( '/' );
+        if ( sep_pos != std::string::npos ) {
+          std::string claimed_joint = claimed_if.substr( 0, sep_pos );
+          if ( claimed_joint == joint_name ) {
+            controllers_to_deactivate.push_back( ctrl.name );
+            break; // No need to check more interfaces for this controller
+          }
+        }
+      }
+    }
+  }
+
+  // Step 3: If none to deactivate, return early
+  if ( controllers_to_deactivate.empty() ) {
+    RCLCPP_INFO( node_->get_logger(), "No active controllers claiming joint '%s'",
+                 joint_name.c_str() );
+    return true;
+  }
+
+  // Step 4: Deactivate the identified controllers
+  return deactivateControllers( controllers_to_deactivate, timeout_s );
+}
+
 } // namespace controller_orchestrator

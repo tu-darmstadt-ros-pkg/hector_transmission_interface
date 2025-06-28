@@ -5,11 +5,11 @@
 #ifndef DYNAMIC_OFFSET_TRANSMISSION_HPP
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
+#include <controller_orchestrator/controller_orchestrator.hpp>
 #include <filesystem>
 #include <fstream>
 #include <hector_transmission_interface_msgs/srv/set_transmission_offset.hpp>
 #include <transmission_interface/simple_transmission.hpp>
-
 namespace hector_transmission_interface
 {
 class DynamicOffsetTransmission : public transmission_interface::SimpleTransmission
@@ -28,9 +28,11 @@ private:
   void saveTransmissionOffset() const;
 
   rclcpp::Node::SharedPtr node_;
-  rclcpp::Service<hector_transmission_interface_msgs::srv::SetTransmissionOffset> set_offset_service_;
+  rclcpp::Service<hector_transmission_interface_msgs::srv::SetTransmissionOffset>::SharedPtr
+      set_offset_service_;
   std::string joint_name_;
   std::filesystem::path transmission_file_path_;
+  controller_orchestrator::ControllerOrchestrator controller_orchestrator_;
 };
 
 inline DynamicOffsetTransmission::DynamicOffsetTransmission( const rclcpp::Node::SharedPtr node,
@@ -38,11 +40,17 @@ inline DynamicOffsetTransmission::DynamicOffsetTransmission( const rclcpp::Node:
                                                              const double joint_to_actuator_reduction,
                                                              const double joint_offset )
     : SimpleTransmission( joint_to_actuator_reduction, joint_offset ), node_( node ),
-      set_offset_service_(), joint_name_( joint_name )
+      joint_name_( joint_name ), controller_orchestrator_( node )
 {
   // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
   transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
+  set_offset_service_ =
+      node_->create_service<hector_transmission_interface_msgs::srv::SetTransmissionOffset>(
+          "update_offset/" + joint_name_,
+          std::bind( &DynamicOffsetTransmission::setTransmissionOffset, this, std::placeholders::_1,
+                     std::placeholders::_2 ) );
+  loadTransmissionOffset(); // if file exists the offset is read and set
 }
 
 inline void DynamicOffsetTransmission::loadTransmissionOffset()
@@ -92,6 +100,12 @@ inline bool DynamicOffsetTransmission::setTransmissionOffset(
     const hector_transmission_interface_msgs::srv::SetTransmissionOffset::Request::SharedPtr request,
     hector_transmission_interface_msgs::srv::SetTransmissionOffset::Response::SharedPtr response )
 {
+  if ( !controller_orchestrator_.unloadControllersOfJoint( joint_name_ ) ) {
+    RCLCPP_ERROR( node_->get_logger(), "Cannot stop all controller of the joint %s",
+                  joint_name_.c_str() );
+    response->success = false;
+    return true;
+  }
   jnt_offset_ = request->offset;
   saveTransmissionOffset();
   response->success = true;

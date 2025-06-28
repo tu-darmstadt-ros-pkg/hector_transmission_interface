@@ -10,10 +10,12 @@
   <author email="aljoscha.schmidt@tu-darmstadt.de">Aljoscha Schmidt</author>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+
   <build_depend>ros2_control_cmake</build_depend>
 
   <depend>ament_cmake_gen_version_h</depend>
   <depend>controller_manager_msgs</depend>
+  <depend>controller_orchestrator</depend>
   <depend>hector_transmission_interface_msgs</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
