@@ -16,7 +16,7 @@ foreach(dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
 endforeach()
 
 add_library(hector_transmission_interface SHARED
-            src/dynamic_offset_transmission_loader.cpp)
+            src/adjustable_offset_transmission_loader.cpp)
 target_include_directories(
   hector_transmission_interface
   PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>

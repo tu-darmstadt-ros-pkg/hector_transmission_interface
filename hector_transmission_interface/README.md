@@ -1,6 +1,16 @@
 # hector_transmission_interface
 
-TODO
+TODOs
+- test transmission interface and loader
+  - setup tranmsisioni interface in dynamixel _controller -> How to test in simulation?
+  -> How? requirres depening on hector_transmission interface
+  - -> alternative service in dynamixel controller to update transmission interface
+- How to update -> send external joint state measumrent and intermally resolce to offset or just send offset?
+
+- dynamixel interface
+  - -> add deactivate on controllers of hardware interface
+
+
 
 - [hector_transmission_interface](#hector_transmission_interface)
 

@@ -29,6 +29,101 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
           callback_group_ );
 }
 
+void ControllerOrchestrator::smartSwitchControllerAsync(
+    std::vector<std::string> activate_controllers,
+    std::function<void( bool success, const std::string &message )> callback ) const
+{
+  if ( activate_controllers.empty() ) {
+    callback( true, "No controllers requested" );
+    return;
+  }
+
+  if ( !list_controllers_client_->service_is_ready() ) {
+    callback( false, "list_controllers service not ready" );
+    return;
+  }
+
+  auto list_req = std::make_shared<ListControllers::Request>();
+  list_controllers_client_->async_send_request(
+      list_req, [=]( rclcpp::Client<ListControllers>::SharedFuture list_future ) {
+        const auto list_resp = list_future.get();
+        if ( !list_resp ) {
+          callback( false, "list_controllers returned null response" );
+          return;
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> controller_to_resources;
+        std::unordered_set<std::string> currently_active;
+        for ( const auto &ctrl : list_resp->controller ) {
+          if ( ctrl.state == "active" )
+            currently_active.insert( ctrl.name );
+          controller_to_resources[ctrl.name] = { ctrl.required_command_interfaces.begin(),
+                                                 ctrl.required_command_interfaces.end() };
+        }
+
+        std::vector<std::string> to_activate;
+        for ( const auto &name : activate_controllers ) {
+          if ( currently_active.count( name ) )
+            continue;
+          if ( controller_to_resources.count( name ) == 0 ) {
+            callback( false, "Controller '" + name + "' not found in list_controllers response" );
+            return;
+          }
+          to_activate.push_back( name );
+        }
+
+        if ( to_activate.empty() ) {
+          callback( true, "All controllers already active" );
+          return;
+        }
+
+        std::unordered_set<std::string> needed_resources;
+        for ( const auto &name : to_activate ) {
+          for ( const auto &res : controller_to_resources.at( name ) ) {
+            if ( !needed_resources.insert( res ).second ) {
+              callback( false, "Resource conflict: interface '" + res +
+                                   "' claimed by multiple controllers" );
+              return;
+            }
+          }
+        }
+
+        std::vector<std::string> to_deactivate;
+        for ( const auto &active_name : currently_active ) {
+          const auto &resources = controller_to_resources.at( active_name );
+          for ( const auto &res : resources ) {
+            if ( needed_resources.count( res ) ) {
+              to_deactivate.push_back( active_name );
+              break;
+            }
+          }
+        }
+
+        if ( !switch_controller_client_->service_is_ready() ) {
+          callback( false, "switch_controller service not ready" );
+          return;
+        }
+
+        auto switch_req = std::make_shared<SwitchController::Request>();
+        switch_req->activate_controllers = to_activate;
+        switch_req->deactivate_controllers = to_deactivate;
+        switch_req->strictness = SwitchController::Request::BEST_EFFORT;
+        switch_req->activate_asap = false;
+        switch_req->timeout.sec = 0;
+        switch_req->timeout.nanosec = 0;
+
+        switch_controller_client_->async_send_request(
+            switch_req, [=]( rclcpp::Client<SwitchController>::SharedFuture switch_future ) {
+              const auto switch_resp = switch_future.get();
+              if ( !switch_resp || !switch_resp->ok ) {
+                std::string msg = switch_resp ? switch_resp->message : "null response";
+                callback( false, "Switching failed: " + msg );
+                return;
+              }
+              callback( true, "Switched controllers successfully" );
+            } );
+      } );
+}
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
                                                     int timeout_s ) const
 {

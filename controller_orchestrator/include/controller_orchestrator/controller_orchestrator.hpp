@@ -35,6 +35,10 @@ public:
   bool smartSwitchController( std::vector<std::string> &activate_controllers,
                               int timeout_s = 2 ) const;
 
+  void smartSwitchControllerAsync(
+      std::vector<std::string> activate_controllers,
+      std::function<void( bool success, const std::string &message )> callback ) const;
+
   std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
                                                                    int timeout_s = 2 ) const;
 
@@ -44,9 +48,9 @@ public:
   bool activateControllers( const std::vector<std::string> &controllers_to_activate,
                             int timeout_s = 2 ) const;
 
-  bool activateControllersOfHardwareInterface( const std::string &hardware_interface,
-                                               const std::vector<std::string> &controllers_to_activate,
-                                               int timeout_s = 2 );
+  /*bool activateControllersOfHardwareInterface( const std::string &hardware_interface,
+                                               const std::vector<std::string>
+     &controllers_to_activate, int timeout_s = 2 );*/
   bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 2 );
 
 private:

@@ -18,7 +18,7 @@ find_package(controller_manager_msgs REQUIRED)
 # -------------------------------------------------------------------
 # 1) Build the controller_orchestrator library
 # -------------------------------------------------------------------
-add_library(${PROJECT_NAME} src/controller_orchestrator.cpp)
+add_library(${PROJECT_NAME} SHARED src/controller_orchestrator.cpp)
 
 target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

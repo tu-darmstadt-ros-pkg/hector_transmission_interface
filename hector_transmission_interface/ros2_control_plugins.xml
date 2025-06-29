@@ -1,7 +1,7 @@
 <library path="transmission_interface">
     <!-- Transmission types -->
-    <class name="transmission_interface/DynamicOffsetTransmission"
-           type="transmission_interface::DynamicOffsetTransmissionLoader"
+    <class name="hector_transmission_interface/AdjustableOffsetTransmission"
+           type="hector_transmission_interface::AdjustableOffsetTransmissionLoader"
            base_class_type="transmission_interface::TransmissionLoader">
         <description>
             Load configuration of a dynamic offset transmission from a URDF description.

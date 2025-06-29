@@ -27,7 +27,7 @@ int main( int argc, char **argv )
         }
         called = true;
 
-        // Replace these names with controllers that actually exist on your system
+        /*// Replace these names with controllers that actually exist on your system
         std::vector<std::string> controllers_to_activate = {
             "moveit_twist_controller",
             //"arm_trajectory_controller"
@@ -58,7 +58,8 @@ int main( int argc, char **argv )
           RCLCPP_ERROR( node->get_logger(), "[Test] Failed to deactivate controllers" );
         } else {
           RCLCPP_INFO( node->get_logger(), "[Test] Successfully deactivated controllers" );
-        }
+        }*/
+        orchestrator->unloadControllersOfJoint( "arm_joint_1", 10 );
       } );
 
   // 5) Create a MultiThreadedExecutor with at least 2 threads.
