@@ -17,16 +17,13 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
     : node_( node ), controller_manager_name_( controller_manager_name )
 {
   callback_group_ = node_->create_callback_group( rclcpp::CallbackGroupType::Reentrant );
-  list_controllers_client_ =
-      node_->create_client<ListControllers>( controller_manager_name_ + "/list_controllers",
-                                             rmw_qos_profile_services_default, callback_group_ );
-  switch_controller_client_ =
-      node_->create_client<SwitchController>( controller_manager_name_ + "/switch_controller",
-                                              rmw_qos_profile_services_default, callback_group_ );
+  list_controllers_client_ = node_->create_client<ListControllers>(
+      controller_manager_name_ + "/list_controllers", rclcpp::QoS( 10 ), callback_group_ );
+  switch_controller_client_ = node_->create_client<SwitchController>(
+      controller_manager_name_ + "/switch_controller", rclcpp::QoS( 10 ), callback_group_ );
   list_hardware_components_client_ =
       node_->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
-          controller_manager_name_ + "/list_hardware_components", rmw_qos_profile_services_default,
-          callback_group_ );
+          controller_manager_name_ + "/list_hardware_components", rclcpp::QoS( 10 ), callback_group_ );
 }
 
 void ControllerOrchestrator::smartSwitchControllerAsync(
