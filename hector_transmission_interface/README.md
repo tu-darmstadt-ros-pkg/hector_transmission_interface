@@ -1,48 +1,15 @@
 # hector_transmission_interface
 
-TODOs
-- test transmission interface and loader
-  - setup tranmsisioni interface in dynamixel _controller -> How to test in simulation?
-  -> How? requirres depening on hector_transmission interface
-  - -> alternative service in dynamixel controller to update transmission interface
-- How to update -> send external joint state measumrent and intermally resolce to offset or just send offset?
+## Adjustable Offset Transmission Interface
+Extends the simple transmission interface to store/load offsets and adjust them. Can be used to detect and correct
+slipping of a transmission, for example a belt or a chain.
+Make sure to unload all controllers before changing the offsets!!
 
-- dynamixel interface
-  - -> add deactivate on controllers of hardware interface
+## Controller Orchestrator
+Defines several convenience functions for interacting with the controller manager.
+#### Smart Switching
+Allows to activate a list of controllers and if necessary deactivate all controllers that are currently claiming a required command interface.
+#### Get Active Controllers of Hardware Interface
+Allows to get a list of all active controllers claiming joints of a specific hardware interface. Allows to deactivate all controllers
+of the hardware interface.
 
-
-
-- [hector_transmission_interface](#hector_transmission_interface)
-
-
-## `hector_transmission_interface`
-
-### Subscribed Topics
-
-| Topic | Type | Description |
-| --- | --- | --- |
-|  |  |  |
-
-### Published Topics
-
-| Topic | Type | Description |
-| --- | --- | --- |
-|  |  |  |
-
-### Services
-
-| Service | Type | Description |
-| --- | --- | --- |
-|  |  |  |
-
-### Actions
-
-| Action | Type | Description |
-| --- | --- | --- |
-|  |  |  |
-
-### Parameters
-
-| Parameter | Type | Description |
-| --- | --- | --- |
-|  |  |  |

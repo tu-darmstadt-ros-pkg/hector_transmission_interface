@@ -32,9 +32,6 @@ jobs:
         with:
           extra_args: --all-files
 
-
-
-
   build-and-test:
     needs: Linting
     strategy:
