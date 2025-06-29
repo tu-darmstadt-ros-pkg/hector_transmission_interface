@@ -8,8 +8,8 @@
 #include <controller_orchestrator/controller_orchestrator.hpp>
 #include <filesystem>
 #include <fstream>
-#include <hector_transmission_interface_msgs/srv/set_transmission_offset.hpp>
 #include <transmission_interface/simple_transmission.hpp>
+
 namespace hector_transmission_interface
 {
 class AdjustableOffsetTransmission : public transmission_interface::SimpleTransmission
