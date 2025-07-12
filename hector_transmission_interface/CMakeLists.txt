@@ -31,6 +31,15 @@ ament_target_dependencies(hector_transmission_interface
 pluginlib_export_plugin_description_file(hector_transmission_interface
                                          ros2_control_plugins.xml)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_adjustable_offset_transmission
+                  test/test_adjustable_offset_transmission.cpp)
+  target_link_libraries(test_adjustable_offset_transmission
+                        hector_transmission_interface ${rclcpp_LIBRARIES})
+  ament_target_dependencies(test_adjustable_offset_transmission rclcpp
+                            transmission_interface)
+endif()
 install(DIRECTORY include/ DESTINATION include/hector_transmission_interface)
 install(
   TARGETS hector_transmission_interface

@@ -28,6 +28,7 @@ public:
   void adjustTransmissionOffset( double offset );
 
 private:
+  bool existsTransmissionOffsetFile() const;
   void loadTransmissionOffset();
   void saveTransmissionOffset() const;
 
@@ -43,7 +44,22 @@ inline AdjustableOffsetTransmission::AdjustableOffsetTransmission( const std::st
   // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
   transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
-  loadTransmissionOffset(); // if file exists the offset is read and set
+  const auto old_offset = get_joint_offset();
+  if ( existsTransmissionOffsetFile() ) {
+    loadTransmissionOffset();
+  } else {
+    saveTransmissionOffset(); // save the initial offset to file
+  }
+  if ( old_offset != get_joint_offset() ) {
+    RCLCPP_INFO( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                 "Loaded transmission offset for joint '%s': %f from file %s", joint_name_.c_str(),
+                 get_joint_offset(), transmission_file_path_.c_str() );
+  }
+}
+
+inline bool AdjustableOffsetTransmission::existsTransmissionOffsetFile() const
+{
+  return std::filesystem::exists( transmission_file_path_ );
 }
 
 inline void AdjustableOffsetTransmission::loadTransmissionOffset()
