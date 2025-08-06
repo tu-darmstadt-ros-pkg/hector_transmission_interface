@@ -126,31 +126,37 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
 {
   // 1) Wait for and call "list_controllers" to retrieve all controllers’ states
   if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
-    RCLCPP_ERROR( node_->get_logger(), "list_controllers service not available" );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service not available" );
     return false;
   }
 
   auto list_req = std::make_shared<ListControllers::Request>();
-  RCLCPP_INFO( node_->get_logger(),
-               "Calling list_controllers service to retrieve controller states..." );
   auto list_future = list_controllers_client_->async_send_request( list_req );
 
   // Block until either the future is ready or we exceed timeout_s
-  auto status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
+  const auto status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
   if ( status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(), "list_controllers service call timed out (>%d s)", timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service call timed out (>%d s)",
+                  timeout_s );
     return false;
   }
   auto list_resp = list_future.get();
   if ( !list_resp ) {
-    RCLCPP_ERROR( node_->get_logger(), "list_controllers service call failed or returned null" );
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "[ControllerOrchestrator] list_controllers service call failed or returned null" );
     return false;
   }
-  RCLCPP_INFO( node_->get_logger(), "Received list_controllers response with [%zu] controllers.",
-               list_resp->controller.size() );
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "[ControllerOrchestrator] Received list_controllers response with [%zu] controllers.",
+      list_resp->controller.size() );
 
   // Build a map: controller name → vector of claimed interfaces
   std::unordered_map<std::string, std::vector<std::string>> controller_to_resources;
+  std::unordered_map<std::string, std::vector<std::string>> controller_groups;
   // Keep track of which controllers are currently active
   std::unordered_set<std::string> currently_active;
 
@@ -162,6 +168,10 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
     // claimed_interfaces is already a flat string[]
     controller_to_resources[name] = { ctrl_state.required_command_interfaces.begin(),
                                       ctrl_state.required_command_interfaces.end() };
+    for ( const auto &chain : ctrl_state.chain_connections ) {
+      controller_groups[name].push_back( chain.name );
+      controller_groups[chain.name].push_back( name );
+    }
   }
 
   // 2) Skip any controllers in activate_controllers that are already active
@@ -169,8 +179,10 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   to_activate.reserve( activate_controllers.size() );
   for ( const auto &name : activate_controllers ) {
     if ( currently_active.count( name ) ) {
-      RCLCPP_INFO( node_->get_logger(), "Controller '%s' is already active → skipping activation.",
-                   name.c_str() );
+      RCLCPP_DEBUG(
+          node_->get_logger(),
+          "[ControllerOrchestrator] Controller '%s' is already active → skipping activation.",
+          name.c_str() );
     } else {
       if ( controller_to_resources.find( name ) == controller_to_resources.end() ) {
         RCLCPP_ERROR( node_->get_logger(),
@@ -182,8 +194,29 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   }
 
   if ( to_activate.empty() ) {
-    RCLCPP_INFO( node_->get_logger(), "No new controllers to activate; all are already active." );
+    RCLCPP_DEBUG(
+        node_->get_logger(),
+        "[ControllerOrchestrator] No new controllers to activate; all are already active." );
     return true;
+  }
+
+  // Recursively, add all controllers of a group with at least one to_activate controller
+  bool added = true;
+  while ( added ) {
+    added = false;
+    std::vector<std::string> new_members;
+    for ( const auto &name : to_activate ) {
+      for ( const auto &group_member : controller_groups[name] ) {
+        if ( std::find( to_activate.begin(), to_activate.end(), group_member ) == to_activate.end() &&
+             std::find( new_members.begin(), new_members.end(), group_member ) == new_members.end() ) {
+          new_members.push_back( group_member );
+        }
+      }
+    }
+    if ( !new_members.empty() ) {
+      to_activate.insert( to_activate.end(), new_members.begin(), new_members.end() );
+      added = true;
+    }
   }
 
   // 3) Build a set of all interfaces needed by the controllers we will activate
@@ -225,9 +258,28 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
     }
   }
 
+  // Recursively, add all controllers of a group with at least one to_deactivate controller
+  added = true;
+  while ( added ) {
+    added = false;
+    std::vector<std::string> new_members;
+    for ( const auto &name : to_deactivate ) {
+      for ( const auto &group_member : controller_groups[name] ) {
+        if ( std::find( to_deactivate.begin(), to_deactivate.end(), group_member ) ==
+             to_deactivate.end() ) {
+          new_members.push_back( group_member );
+        }
+      }
+    }
+    if ( !new_members.empty() ) {
+      to_deactivate.insert( to_deactivate.end(), new_members.begin(), new_members.end() );
+      added = true;
+    }
+  }
   // 5) Finally, call switch_controller with start=to_activate, stop=to_deactivate
   if ( !switch_controller_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
-    RCLCPP_ERROR( node_->get_logger(), "switch_controller service not available" );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] switch_controller service not available" );
     return false;
   }
 
@@ -244,7 +296,9 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   // Block until either the future is ready or we exceed timeout_s
   auto switch_status = switch_future.wait_for( std::chrono::seconds( timeout_s ) );
   if ( switch_status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(), "switch_controller service call timed out (>%d s)", timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] switch_controller service call timed out (>%d s)",
+                  timeout_s );
     return false;
   }
   auto switch_resp = switch_future.get();
@@ -267,9 +321,10 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
 {
   // 1) Wait for and call "list_hardware_components"
   if ( !list_hardware_components_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
-    RCLCPP_ERROR(
-        node_->get_logger(), "getActiveControllerOfHardwareInterface: list_hardware_components service not available after %d s",
-        timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] getActiveControllerOfHardwareInterface: "
+                  "list_hardware_components service not available after %d s",
+                  timeout_s );
     return {};
   }
   auto hw_req = std::make_shared<ListHardwareComponents::Request>();
@@ -377,7 +432,9 @@ bool ControllerOrchestrator::deactivateControllers(
   // Block until either the future is ready or we exceed timeout_s
   auto switch_status = switch_future.wait_for( std::chrono::seconds( timeout_s ) );
   if ( switch_status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(), "switch_controller service call timed out (>%d s)", timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] switch_controller service call timed out (>%d s)",
+                  timeout_s );
     return false;
   }
   auto switch_resp = switch_future.get();
@@ -406,7 +463,9 @@ bool ControllerOrchestrator::activateControllers(
   // Block until either the future is ready or we exceed timeout_s
   auto switch_status = switch_future.wait_for( std::chrono::seconds( timeout_s ) );
   if ( switch_status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(), "switch_controller service call timed out (>%d s)", timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] switch_controller service call timed out (>%d s)",
+                  timeout_s );
     return false;
   }
   auto switch_resp = switch_future.get();
@@ -428,7 +487,9 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
   auto list_status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
 
   if ( list_status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(), "list_controllers service call timed out (>%d s)", timeout_s );
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service call timed out (>%d s)",
+                  timeout_s );
     return false;
   }
 
@@ -454,7 +515,8 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
 
   // Step 3: If none to deactivate, return early
   if ( controllers_to_deactivate.empty() ) {
-    RCLCPP_INFO( node_->get_logger(), "No active controllers claiming joint '%s'",
+    RCLCPP_INFO( node_->get_logger(),
+                 "[ControllerOrchestrator] No active controllers claiming joint '%s'",
                  joint_name.c_str() );
     return true;
   }
