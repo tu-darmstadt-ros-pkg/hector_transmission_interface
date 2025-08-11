@@ -54,6 +54,9 @@ public:
   bool unloadControllersOfJoint( const std::string &joint_name, int timeout_s = 2 );
 
 private:
+  bool smartSwitchControllerAnalysis(
+      std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
+      const controller_manager_msgs::srv::ListControllers_Response &req ) const;
   rclcpp::Node::SharedPtr node_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   std::string controller_manager_name_;

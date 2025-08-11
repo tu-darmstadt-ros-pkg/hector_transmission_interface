@@ -121,75 +121,49 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
             } );
       } );
 }
-bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
-                                                    int timeout_s ) const
+bool ControllerOrchestrator::smartSwitchControllerAnalysis(
+    std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
+    const controller_manager_msgs::srv::ListControllers_Response &res ) const
 {
-  // 1) Wait for and call "list_controllers" to retrieve all controllers’ states
-  if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
-    RCLCPP_ERROR( node_->get_logger(),
-                  "[ControllerOrchestrator] list_controllers service not available" );
-    return false;
-  }
-
-  auto list_req = std::make_shared<ListControllers::Request>();
-  auto list_future = list_controllers_client_->async_send_request( list_req );
-
-  // Block until either the future is ready or we exceed timeout_s
-  const auto status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
-  if ( status == std::future_status::timeout ) {
-    RCLCPP_ERROR( node_->get_logger(),
-                  "[ControllerOrchestrator] list_controllers service call timed out (>%d s)",
-                  timeout_s );
-    return false;
-  }
-  auto list_resp = list_future.get();
-  if ( !list_resp ) {
-    RCLCPP_ERROR(
-        node_->get_logger(),
-        "[ControllerOrchestrator] list_controllers service call failed or returned null" );
-    return false;
-  }
-  RCLCPP_INFO(
-      node_->get_logger(),
-      "[ControllerOrchestrator] Received list_controllers response with [%zu] controllers.",
-      list_resp->controller.size() );
-
   // Build a map: controller name → vector of claimed interfaces
   std::unordered_map<std::string, std::vector<std::string>> controller_to_resources;
-  std::unordered_map<std::string, std::vector<std::string>> controller_groups;
-  // Keep track of which controllers are currently active
-  std::unordered_set<std::string> currently_active;
+  std::unordered_map<std::string, std::vector<std::string>> chain_connections;
+  std::vector<std::string> currently_active;
 
-  for ( const auto &ctrl_state : list_resp->controller ) {
+  // remove controller from to activate that do not exist
+  for ( auto it = to_activate.begin(); it != to_activate.end(); ) {
+    if ( std::find_if( res.controller.begin(), res.controller.end(), [&it]( const auto &ctrl ) {
+           return ctrl.name == *it;
+         } ) == res.controller.end() ) {
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "[ControllerOrchestrator] Controller '%s' not found in list_controllers response; "
+          "removing from activation list.",
+          it->c_str() );
+      it = to_activate.erase( it );
+    } else {
+      ++it;
+    }
+  }
+
+  // Remove controllers from the activation list that are already active
+  for ( const auto &ctrl_state : res.controller ) {
     const std::string &name = ctrl_state.name;
     if ( ctrl_state.state == "active" ) {
-      currently_active.insert( name );
+      currently_active.push_back( name );
+      if ( std::find( to_activate.begin(), to_activate.end(), name ) != to_activate.end() ) {
+        RCLCPP_DEBUG(
+            node_->get_logger(), "[ControllerOrchestrator] Controller '%s' is already active; removing from activation list.",
+            name.c_str() );
+        to_activate.erase( std::remove( to_activate.begin(), to_activate.end(), name ),
+                           to_activate.end() );
+      }
     }
     // claimed_interfaces is already a flat string[]
     controller_to_resources[name] = { ctrl_state.required_command_interfaces.begin(),
                                       ctrl_state.required_command_interfaces.end() };
     for ( const auto &chain : ctrl_state.chain_connections ) {
-      controller_groups[name].push_back( chain.name );
-      controller_groups[chain.name].push_back( name );
-    }
-  }
-
-  // 2) Skip any controllers in activate_controllers that are already active
-  std::vector<std::string> to_activate;
-  to_activate.reserve( activate_controllers.size() );
-  for ( const auto &name : activate_controllers ) {
-    if ( currently_active.count( name ) ) {
-      RCLCPP_DEBUG(
-          node_->get_logger(),
-          "[ControllerOrchestrator] Controller '%s' is already active → skipping activation.",
-          name.c_str() );
-    } else {
-      if ( controller_to_resources.find( name ) == controller_to_resources.end() ) {
-        RCLCPP_ERROR( node_->get_logger(),
-                      "Controller '%s' was not found in list_controllers response", name.c_str() );
-        return false;
-      }
-      to_activate.push_back( name );
+      chain_connections[name].push_back( chain.name );
     }
   }
 
@@ -206,7 +180,7 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
     added = false;
     std::vector<std::string> new_members;
     for ( const auto &name : to_activate ) {
-      for ( const auto &group_member : controller_groups[name] ) {
+      for ( const auto &group_member : chain_connections[name] ) {
         if ( std::find( to_activate.begin(), to_activate.end(), group_member ) == to_activate.end() &&
              std::find( new_members.begin(), new_members.end(), group_member ) == new_members.end() ) {
           new_members.push_back( group_member );
@@ -238,9 +212,6 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   }
 
   // 4) Compare needed_resources against interfaces held by currently active controllers
-  std::vector<std::string> to_deactivate;
-  to_deactivate.reserve( currently_active.size() );
-
   for ( const auto &active_name : currently_active ) {
     const auto &active_resources = controller_to_resources.at( active_name );
     bool conflict = false;
@@ -258,16 +229,19 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
     }
   }
 
-  // Recursively, add all controllers of a group with at least one to_deactivate controller
+  // Recursively, add all active controllers that depend on a controller in to_deactivate
+  // they cannot remain active if one of their chain connections is to be deactivated
   added = true;
   while ( added ) {
     added = false;
     std::vector<std::string> new_members;
-    for ( const auto &name : to_deactivate ) {
-      for ( const auto &group_member : controller_groups[name] ) {
-        if ( std::find( to_deactivate.begin(), to_deactivate.end(), group_member ) ==
-             to_deactivate.end() ) {
-          new_members.push_back( group_member );
+    for ( const auto &name : currently_active ) {
+      for ( const auto &chain_connection : chain_connections[name] ) {
+        if ( std::find( to_deactivate.begin(), to_deactivate.end(), chain_connection ) ==
+                 to_deactivate.end() &&
+             std::find( new_members.begin(), new_members.end(), chain_connection ) ==
+                 new_members.end() ) {
+          new_members.push_back( chain_connection );
         }
       }
     }
@@ -276,15 +250,59 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
       added = true;
     }
   }
-  // 5) Finally, call switch_controller with start=to_activate, stop=to_deactivate
+
+  return true;
+}
+
+bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
+                                                    int timeout_s ) const
+{
+  // 1) Get controller information from controller manager (blocking call)
+  if ( !list_controllers_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service not available" );
+    return false;
+  }
+
+  auto list_req = std::make_shared<ListControllers::Request>();
+  auto list_future = list_controllers_client_->async_send_request( list_req );
+
+  // Block until either the future is ready or we exceed timeout_s
+  const auto status = list_future.wait_for( std::chrono::seconds( timeout_s ) );
+  if ( status == std::future_status::timeout ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] list_controllers service call timed out (>%d s)",
+                  timeout_s );
+    return false;
+  }
+  auto list_resp = list_future.get();
+  if ( !list_resp ) {
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "[ControllerOrchestrator] list_controllers service call failed or returned null" );
+    return false;
+  }
+
+  // 2) Analyze which controllers to activate and which to deactivate
+  std::vector<std::string> to_deactivate;
+  if ( !smartSwitchControllerAnalysis( activate_controllers, to_deactivate, *list_resp ) ) {
+    RCLCPP_ERROR( node_->get_logger(),
+                  "[ControllerOrchestrator] smartSwitchControllerAnalysis failed" );
+    return false;
+  }
+  if ( activate_controllers.empty() && to_deactivate.empty() ) {
+    RCLCPP_DEBUG( node_->get_logger(),
+                  "[ControllerOrchestrator] No controllers to activate or deactivate." );
+    return true;
+  }
+  // 3) Finally, call switch_controller with start=to_activate, stop=to_deactivate (blocking call)
   if ( !switch_controller_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
     RCLCPP_ERROR( node_->get_logger(),
                   "[ControllerOrchestrator] switch_controller service not available" );
     return false;
   }
-
-  auto switch_req = std::make_shared<SwitchController::Request>();
-  switch_req->activate_controllers = to_activate;
+  const auto switch_req = std::make_shared<SwitchController::Request>();
+  switch_req->activate_controllers = activate_controllers;
   switch_req->deactivate_controllers = to_deactivate;
   switch_req->strictness = SwitchController::Request::BEST_EFFORT;
   switch_req->activate_asap = false;
@@ -312,7 +330,7 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
 
   RCLCPP_INFO( node_->get_logger(),
                "Successfully switched controllers. Activated [%zu], deactivated [%zu].",
-               to_activate.size(), to_deactivate.size() );
+               activate_controllers.size(), to_deactivate.size() );
   return true;
 }
 
