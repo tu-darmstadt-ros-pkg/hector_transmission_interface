@@ -9,6 +9,23 @@
 namespace controller_orchestrator
 {
 
+std::string vecToString( const std::vector<std::string> &vec )
+{
+  std::string result;
+  for ( const auto &item : vec ) {
+    if ( !result.empty() ) {
+      result += ", ";
+    }
+    result += item;
+  }
+  return result;
+}
+
+inline bool in( const std::vector<std::string> &vec, const std::string &item )
+{
+  return std::find( vec.begin(), vec.end(), item ) != vec.end();
+}
+
 using ListControllers = controller_manager_msgs::srv::ListControllers;
 using SwitchController = controller_manager_msgs::srv::SwitchController;
 
@@ -27,8 +44,8 @@ ControllerOrchestrator::ControllerOrchestrator( const rclcpp::Node::SharedPtr &n
 }
 
 void ControllerOrchestrator::smartSwitchControllerAsync(
-    std::vector<std::string> activate_controllers,
-    std::function<void( bool success, const std::string &message )> callback ) const
+    const std::vector<std::string> &activate_controllers,
+    const std::function<void( bool success, const std::string &message )> &callback ) const
 {
   if ( activate_controllers.empty() ) {
     callback( true, "No controllers requested" );
@@ -49,51 +66,15 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
           return;
         }
 
-        std::unordered_map<std::string, std::vector<std::string>> controller_to_resources;
-        std::unordered_set<std::string> currently_active;
-        for ( const auto &ctrl : list_resp->controller ) {
-          if ( ctrl.state == "active" )
-            currently_active.insert( ctrl.name );
-          controller_to_resources[ctrl.name] = { ctrl.required_command_interfaces.begin(),
-                                                 ctrl.required_command_interfaces.end() };
-        }
-
-        std::vector<std::string> to_activate;
-        for ( const auto &name : activate_controllers ) {
-          if ( currently_active.count( name ) )
-            continue;
-          if ( controller_to_resources.count( name ) == 0 ) {
-            callback( false, "Controller '" + name + "' not found in list_controllers response" );
-            return;
-          }
-          to_activate.push_back( name );
-        }
-
-        if ( to_activate.empty() ) {
-          callback( true, "All controllers already active" );
+        std::vector<std::string> to_deactivate;
+        std::vector<std::string> to_activate = activate_controllers;
+        if ( !smartSwitchControllerAnalysis( to_activate, to_deactivate, *list_resp ) ) {
+          callback( false, "smartSwitchControllerAnalysis failed" );
           return;
         }
 
-        std::unordered_set<std::string> needed_resources;
-        for ( const auto &name : to_activate ) {
-          for ( const auto &res : controller_to_resources.at( name ) ) {
-            if ( !needed_resources.insert( res ).second ) {
-              callback( false, "Resource conflict: interface '" + res +
-                                   "' claimed by multiple controllers" );
-              return;
-            }
-          }
-        }
-
-        std::vector<std::string> to_deactivate;
-        for ( const auto &active_name : currently_active ) {
-          const auto &resources = controller_to_resources.at( active_name );
-          for ( const auto &res : resources ) {
-            if ( needed_resources.count( res ) ) {
-              to_deactivate.push_back( active_name );
-              break;
-            }
-          }
+        if ( to_activate.empty() ) {
+          callback( true, "No controllers to activate or deactivate" );
         }
 
         if ( !switch_controller_client_->service_is_ready() ) {
@@ -113,7 +94,7 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
             switch_req, [=]( rclcpp::Client<SwitchController>::SharedFuture switch_future ) {
               const auto switch_resp = switch_future.get();
               if ( !switch_resp || !switch_resp->ok ) {
-                std::string msg = switch_resp ? switch_resp->message : "null response";
+                const std::string msg = switch_resp ? switch_resp->message : "null response";
                 callback( false, "Switching failed: " + msg );
                 return;
               }
@@ -151,7 +132,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     const std::string &name = ctrl_state.name;
     if ( ctrl_state.state == "active" ) {
       currently_active.push_back( name );
-      if ( std::find( to_activate.begin(), to_activate.end(), name ) != to_activate.end() ) {
+      if ( in( to_activate, name ) ) {
         RCLCPP_DEBUG(
             node_->get_logger(), "[ControllerOrchestrator] Controller '%s' is already active; removing from activation list.",
             name.c_str() );
@@ -180,10 +161,9 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     added = false;
     std::vector<std::string> new_members;
     for ( const auto &name : to_activate ) {
-      for ( const auto &group_member : chain_connections[name] ) {
-        if ( std::find( to_activate.begin(), to_activate.end(), group_member ) == to_activate.end() &&
-             std::find( new_members.begin(), new_members.end(), group_member ) == new_members.end() ) {
-          new_members.push_back( group_member );
+      for ( const auto &chain_connection : chain_connections[name] ) {
+        if ( !in( to_activate, chain_connection ) && !in( new_members, chain_connection ) ) {
+          new_members.push_back( chain_connection );
         }
       }
     }
@@ -222,9 +202,9 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
       }
     }
     if ( conflict ) {
-      RCLCPP_WARN( node_->get_logger(),
-                   "Active controller '%s' will be stopped due to resource conflict.",
-                   active_name.c_str() );
+      RCLCPP_DEBUG( node_->get_logger(),
+                    "Active controller '%s' will be stopped due to resource conflict.",
+                    active_name.c_str() );
       to_deactivate.push_back( active_name );
     }
   }
@@ -237,11 +217,13 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     std::vector<std::string> new_members;
     for ( const auto &name : currently_active ) {
       for ( const auto &chain_connection : chain_connections[name] ) {
-        if ( std::find( to_deactivate.begin(), to_deactivate.end(), chain_connection ) ==
-                 to_deactivate.end() &&
-             std::find( new_members.begin(), new_members.end(), chain_connection ) ==
-                 new_members.end() ) {
-          new_members.push_back( chain_connection );
+        // add to deactivate if:
+        // - the chained controller is in to_deactivate (a controller the active controller depends on)
+        // - the active controller is not already in to_deactivate (or in new_members)
+
+        if ( in( to_deactivate, chain_connection ) && !in( new_members, name ) &&
+             !in( to_deactivate, name ) ) {
+          new_members.push_back( name );
         }
       }
     }
@@ -251,6 +233,10 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     }
   }
 
+  RCLCPP_DEBUG( node_->get_logger(),
+                "[ControllerOrchestrator] Analysis complete: "
+                "\nActivating %s controllers, \nDeactivating %s controllers.",
+                vecToString( to_activate ).c_str(), vecToString( to_deactivate ).c_str() );
   return true;
 }
 

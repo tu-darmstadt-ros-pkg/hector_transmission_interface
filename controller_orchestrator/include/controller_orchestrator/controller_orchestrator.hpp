@@ -36,8 +36,8 @@ public:
                               int timeout_s = 2 ) const;
 
   void smartSwitchControllerAsync(
-      std::vector<std::string> activate_controllers,
-      std::function<void( bool success, const std::string &message )> callback ) const;
+      const std::vector<std::string> &activate_controllers,
+      const std::function<void( bool success, const std::string &message )> &callback ) const;
 
   std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
                                                                    int timeout_s = 2 ) const;
