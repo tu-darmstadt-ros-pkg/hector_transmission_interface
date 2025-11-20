@@ -57,6 +57,13 @@ private:
   bool smartSwitchControllerAnalysis(
       std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
       const controller_manager_msgs::srv::ListControllers_Response &req ) const;
+  void recursiveActivateControllers(
+      std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
+      const std::function<void( bool success, const std::string &message )> &callback ) const;
+  void recursiveDeactivateControllers(
+      std::shared_ptr<std::vector<std::string>> controllers_to_activate,
+      std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
+      const std::function<void( bool success, const std::string &message )> &callback ) const;
   rclcpp::Node::SharedPtr node_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   std::string controller_manager_name_;
