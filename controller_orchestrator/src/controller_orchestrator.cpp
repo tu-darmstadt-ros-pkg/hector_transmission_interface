@@ -1,7 +1,9 @@
 #include "controller_orchestrator/controller_orchestrator.hpp"
+
 #include <chrono>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
+#include <memory>
 #include <rclcpp/rclcpp.hpp>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,15 +68,17 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
           return;
         }
 
-        std::vector<std::string> to_deactivate;
-        std::vector<std::string> to_activate = activate_controllers;
-        if ( !smartSwitchControllerAnalysis( to_activate, to_deactivate, *list_resp ) ) {
+        auto to_deactivate = std::make_shared<std::vector<std::string>>();
+        auto to_activate = std::make_shared<std::vector<std::string>>( activate_controllers );
+
+        if ( !smartSwitchControllerAnalysis( *to_activate, *to_deactivate, *list_resp ) ) {
           callback( false, "smartSwitchControllerAnalysis failed" );
           return;
         }
 
-        if ( to_activate.empty() ) {
+        if ( to_activate->empty() && to_deactivate->empty() ) {
           callback( true, "No controllers to activate or deactivate" );
+          return;
         }
 
         if ( !switch_controller_client_->service_is_ready() ) {
@@ -82,26 +86,17 @@ void ControllerOrchestrator::smartSwitchControllerAsync(
           return;
         }
 
-        auto switch_req = std::make_shared<SwitchController::Request>();
-        switch_req->activate_controllers = to_activate;
-        switch_req->deactivate_controllers = to_deactivate;
-        switch_req->strictness = SwitchController::Request::BEST_EFFORT;
-        switch_req->activate_asap = false;
-        switch_req->timeout.sec = 0;
-        switch_req->timeout.nanosec = 0;
-
-        switch_controller_client_->async_send_request(
-            switch_req, [=]( rclcpp::Client<SwitchController>::SharedFuture switch_future ) {
-              const auto switch_resp = switch_future.get();
-              if ( !switch_resp || !switch_resp->ok ) {
-                const std::string msg = switch_resp ? switch_resp->message : "null response";
-                callback( false, "Switching failed: " + msg );
-                return;
-              }
-              callback( true, "Switched controllers successfully" );
-            } );
+        if ( !to_deactivate->empty() ) {
+          // Deactivate from last to first, then activate
+          recursiveDeactivateControllers( to_activate, to_deactivate, to_deactivate->size() - 1,
+                                          callback );
+        } else {
+          // Nothing to deactivate, only activate
+          recursiveActivateControllers( to_activate, to_activate->size() - 1, callback );
+        }
       } );
 }
+
 bool ControllerOrchestrator::smartSwitchControllerAnalysis(
     std::vector<std::string> &to_activate, std::vector<std::string> &to_deactivate,
     const controller_manager_msgs::srv::ListControllers_Response &res ) const
@@ -111,7 +106,7 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   std::unordered_map<std::string, std::vector<std::string>> chain_connections;
   std::vector<std::string> currently_active;
 
-  // remove controller from to activate that do not exist
+  // Remove controllers from to_activate that do not exist
   for ( auto it = to_activate.begin(); it != to_activate.end(); ) {
     if ( std::find_if( res.controller.begin(), res.controller.end(), [&it]( const auto &ctrl ) {
            return ctrl.name == *it;
@@ -140,7 +135,6 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
                            to_activate.end() );
       }
     }
-    // claimed_interfaces is already a flat string[]
     controller_to_resources[name] = { ctrl_state.required_command_interfaces.begin(),
                                       ctrl_state.required_command_interfaces.end() };
     for ( const auto &chain : ctrl_state.chain_connections ) {
@@ -179,15 +173,15 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
 
   for ( const auto &name : to_activate ) {
     const auto &resources = controller_to_resources.at( name );
-    for ( const auto &res : resources ) {
-      if ( needed_resources.count( res ) ) {
+    for ( const auto &res_name : resources ) {
+      if ( needed_resources.count( res_name ) ) {
         RCLCPP_ERROR( node_->get_logger(),
                       "Resource conflict among requested controllers: "
                       "interface '%s' requested by more than one controller.",
-                      res.c_str() );
+                      res_name.c_str() );
         return false;
       }
-      needed_resources.insert( res );
+      needed_resources.insert( res_name );
     }
   }
 
@@ -195,8 +189,8 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   for ( const auto &active_name : currently_active ) {
     const auto &active_resources = controller_to_resources.at( active_name );
     bool conflict = false;
-    for ( const auto &res : active_resources ) {
-      if ( needed_resources.count( res ) ) {
+    for ( const auto &res_name : active_resources ) {
+      if ( needed_resources.count( res_name ) ) {
         conflict = true;
         break;
       }
@@ -210,17 +204,12 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
   }
 
   // Recursively, add all active controllers that depend on a controller in to_deactivate
-  // they cannot remain active if one of their chain connections is to be deactivated
   added = true;
   while ( added ) {
     added = false;
     std::vector<std::string> new_members;
     for ( const auto &name : currently_active ) {
       for ( const auto &chain_connection : chain_connections[name] ) {
-        // add to deactivate if:
-        // - the chained controller is in to_deactivate (a controller the active controller depends on)
-        // - the active controller is not already in to_deactivate (or in new_members)
-
         if ( in( to_deactivate, chain_connection ) && !in( new_members, name ) &&
              !in( to_deactivate, name ) ) {
           new_members.push_back( name );
@@ -238,6 +227,90 @@ bool ControllerOrchestrator::smartSwitchControllerAnalysis(
                 "\nActivating %s controllers, \nDeactivating %s controllers.",
                 vecToString( to_activate ).c_str(), vecToString( to_deactivate ).c_str() );
   return true;
+}
+
+void ControllerOrchestrator::recursiveActivateControllers(
+    std::shared_ptr<std::vector<std::string>> controllers_to_activate, size_t index,
+    const std::function<void( bool success, const std::string &message )> &callback ) const
+{
+  if ( !controllers_to_activate || index >= controllers_to_activate->size() ) {
+    // All activations complete
+    callback( true, "Weird error should not happen." );
+    return;
+  }
+
+  auto act_switch_req = std::make_shared<SwitchController::Request>();
+  act_switch_req->activate_controllers = { ( *controllers_to_activate )[index] };
+  act_switch_req->strictness = SwitchController::Request::BEST_EFFORT;
+  act_switch_req->activate_asap = false;
+  act_switch_req->timeout.sec = 0;
+  act_switch_req->timeout.nanosec = 0;
+
+  switch_controller_client_->async_send_request(
+      act_switch_req, [this, controllers_to_activate, index,
+                       callback]( rclcpp::Client<SwitchController>::SharedFuture switch_future ) {
+        const auto act_switch_resp = switch_future.get();
+        if ( !act_switch_resp || !act_switch_resp->ok ) {
+          const std::string msg = act_switch_resp ? act_switch_resp->message : "null response";
+          callback( false, "Failed to activate controller '" + ( *controllers_to_activate )[index] +
+                               "': " + msg );
+          return;
+        }
+        if ( index == 0 ) {
+          // All activations complete
+          callback( true, "Switched controllers successfully" );
+          return;
+        }
+        // Recursively activate the next controller
+        recursiveActivateControllers( controllers_to_activate, index - 1, callback );
+      } );
+}
+
+void ControllerOrchestrator::recursiveDeactivateControllers(
+    std::shared_ptr<std::vector<std::string>> controllers_to_activate,
+    std::shared_ptr<std::vector<std::string>> controllers_to_deactivate, size_t index,
+    const std::function<void( bool success, const std::string &message )> &callback ) const
+{
+  if ( !controllers_to_deactivate || controllers_to_deactivate->empty() ) {
+    // Nothing to deactivate, just activate
+    recursiveActivateControllers( controllers_to_activate, 0, callback );
+    return;
+  }
+
+  if ( index >= controllers_to_deactivate->size() ) {
+    // Done deactivating, now activate
+    recursiveActivateControllers( controllers_to_activate, 0, callback );
+    return;
+  }
+
+  auto deact_switch_req = std::make_shared<SwitchController::Request>();
+  deact_switch_req->deactivate_controllers = { ( *controllers_to_deactivate )[index] };
+  deact_switch_req->strictness = SwitchController::Request::BEST_EFFORT;
+  deact_switch_req->activate_asap = false;
+  deact_switch_req->timeout.sec = 0;
+  deact_switch_req->timeout.nanosec = 0;
+
+  switch_controller_client_->async_send_request(
+      deact_switch_req, [this, controllers_to_activate, controllers_to_deactivate, index,
+                         callback]( rclcpp::Client<SwitchController>::SharedFuture switch_future ) {
+        const auto deact_switch_resp = switch_future.get();
+        if ( !deact_switch_resp || !deact_switch_resp->ok ) {
+          const std::string msg = deact_switch_resp ? deact_switch_resp->message : "null response";
+          callback( false, "Failed to deactivate controller '" +
+                               ( *controllers_to_deactivate )[index] + "': " + msg );
+          return;
+        }
+
+        // Recursively deactivate the next controller (reverse order)
+        if ( index == 0 ) {
+          // All deactivations complete, now activate
+          recursiveActivateControllers( controllers_to_activate,
+                                        controllers_to_activate->size() - 1, callback );
+          return;
+        }
+        recursiveDeactivateControllers( controllers_to_activate, controllers_to_deactivate,
+                                        index - 1, callback );
+      } );
 }
 
 bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &activate_controllers,
@@ -281,6 +354,7 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
                   "[ControllerOrchestrator] No controllers to activate or deactivate." );
     return true;
   }
+
   // 3) Finally, call switch_controller with start=to_activate, stop=to_deactivate (blocking call)
   if ( !switch_controller_client_->wait_for_service( std::chrono::seconds( timeout_s ) ) ) {
     RCLCPP_ERROR( node_->get_logger(),
@@ -309,7 +383,7 @@ bool ControllerOrchestrator::smartSwitchController( std::vector<std::string> &ac
   if ( !switch_resp || !switch_resp->ok ) {
     RCLCPP_ERROR_STREAM(
         node_->get_logger(),
-        "switch_controller service returned ok=false%s"
+        "switch_controller service returned ok=false"
             << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
     return false;
   }
@@ -421,6 +495,7 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
 
   return active_controllers;
 }
+
 bool ControllerOrchestrator::deactivateControllers(
     const std::vector<std::string> &controllers_to_deactivate, int timeout_s ) const
 {
@@ -445,7 +520,7 @@ bool ControllerOrchestrator::deactivateControllers(
   if ( !switch_resp || !switch_resp->ok ) {
     RCLCPP_ERROR_STREAM(
         node_->get_logger(),
-        "switch_controller service returned ok=false%s"
+        "switch_controller service returned ok=false"
             << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
     return false;
   }
@@ -476,7 +551,7 @@ bool ControllerOrchestrator::activateControllers(
   if ( !switch_resp || !switch_resp->ok ) {
     RCLCPP_ERROR_STREAM(
         node_->get_logger(),
-        "switch_controller service returned ok=false%s"
+        "switch_controller service returned ok=false"
             << ( switch_resp ? std::string( ": " + switch_resp->message ) : std::string( "" ) ) );
     return false;
   }
@@ -504,7 +579,6 @@ bool ControllerOrchestrator::unloadControllersOfJoint( const std::string &joint_
   for ( const auto &ctrl : list_resp->controller ) {
     if ( ctrl.state == "active" ) {
       for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
-        // Example claimed interface: "joint1/position", "joint2/velocity"
         const auto sep_pos = claimed_if.find( '/' );
         if ( sep_pos != std::string::npos ) {
           std::string claimed_joint = claimed_if.substr( 0, sep_pos );
