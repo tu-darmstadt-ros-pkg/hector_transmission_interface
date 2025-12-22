@@ -42,6 +42,12 @@ public:
   std::vector<std::string> getActiveControllerOfHardwareInterface( const std::string &hardware_interface,
                                                                    int timeout_s = 2 ) const;
 
+  /**
+   * @brief Deactivate the given controllers. Does not check for conflicts (e.g. if dependent controllers must be deactivated first).
+   * @param controllers_to_deactivate  controllers to deactivate
+   * @param timeout_s
+   * @return
+   */
   bool deactivateControllers( const std::vector<std::string> &controllers_to_deactivate,
                               int timeout_s = 2 ) const;
 

@@ -479,20 +479,28 @@ std::vector<std::string> ControllerOrchestrator::getActiveControllerOfHardwareIn
   }
 
   // 4) Iterate through each controller; if active and any claimed_interface ∈ target_command_interfaces,
-  //    add its name to the result.
+  //    add its name to the result; also add all controllers that are chained to it
   std::vector<std::string> active_controllers;
   for ( const auto &ctrl : list_resp->controller ) {
     if ( ctrl.state != "active" ) {
       continue;
     }
+    bool added_controller = false;
     for ( const auto &claimed_if : ctrl.claimed_interfaces ) {
-      if ( target_command_interfaces.count( claimed_if ) > 0 ) {
-        active_controllers.push_back( ctrl.name );
-        break;
+      for ( const auto &target_if : target_command_interfaces ) {
+        // check if the target interface is equal to the last part of the claimed interface
+        if ( claimed_if.size() >= target_if.size() &&
+             claimed_if.compare( claimed_if.size() - target_if.size(), target_if.size(),
+                                 target_if ) == 0 ) {
+          active_controllers.push_back( ctrl.name );
+          added_controller = true;
+          break;
+        }
       }
+      if ( added_controller )
+        break;
     }
   }
-
   return active_controllers;
 }
 

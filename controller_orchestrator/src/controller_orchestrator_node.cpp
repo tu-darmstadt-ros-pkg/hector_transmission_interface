@@ -5,6 +5,8 @@
 #include "controller_orchestrator/controller_orchestrator.hpp"
 #include <rclcpp/rclcpp.hpp>
 
+// This node is purely for testing the ControllerOrchestrator class quickly.
+
 int main( int argc, char **argv )
 {
   // 1) Initialize ROS 2
@@ -27,24 +29,6 @@ int main( int argc, char **argv )
         }
         called = true;
 
-        /*// Replace these names with controllers that actually exist on your system
-        std::vector<std::string> controllers_to_activate = {
-            "moveit_twist_controller",
-            //"arm_trajectory_controller"
-        };
-
-        RCLCPP_INFO( node->get_logger(), "[Test] Calling smartSwitchController(...) with [%s, %s]",
-                     controllers_to_activate[0].c_str(), controllers_to_activate[0].c_str() );
-
-        // Wait up to 10 seconds for each service call
-        bool success = orchestrator->smartSwitchController( controllers_to_activate, 10 );
-        if ( success ) {
-          RCLCPP_INFO( node->get_logger(),
-                       "[Test] smartSwitchController returned true (switch succeeded)" );
-        } else {
-          RCLCPP_ERROR( node->get_logger(),
-                        "[Test] smartSwitchController returned false (switch failed)" );
-        }
         // deactivate controllers of athena_flipper_interface
         auto to_deactivate =
             orchestrator->getActiveControllerOfHardwareInterface( "athena_flipper_interface", 10 );
@@ -58,8 +42,7 @@ int main( int argc, char **argv )
           RCLCPP_ERROR( node->get_logger(), "[Test] Failed to deactivate controllers" );
         } else {
           RCLCPP_INFO( node->get_logger(), "[Test] Successfully deactivated controllers" );
-        }*/
-        orchestrator->unloadControllersOfJoint( "arm_joint_1", 10 );
+        }
       } );
 
   // 5) Create a MultiThreadedExecutor with at least 2 threads.
