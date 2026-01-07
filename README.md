@@ -75,4 +75,3 @@ transmission->adjustTransmissionOffset(new_offset);
 1. Stop all controllers using the affected joints
 2. Adjust the transmission offset(s)
 3. Restart the controllers
-
