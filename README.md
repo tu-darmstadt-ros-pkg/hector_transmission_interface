@@ -47,25 +47,60 @@ To use the adjustable offset transmission, specify it in your robot's URDF/xacro
 
 ### Adjusting Offsets
 
-#### Method 1: Service Call (Recommended)
-Use the `AdjustTransmissionOffsets` service to adjust offsets at runtime:
+#### Method 1: Programmatic API (Primary Method)
+Access the transmission object from your hardware interface and call `adjustTransmissionOffset()`:
+
+```cpp
+// Cast to AdjustableOffsetTransmission to access the method
+auto* adjustable_transmission = dynamic_cast<hector_transmission_interface::AdjustableOffsetTransmission*>(transmission.get());
+if (adjustable_transmission) {
+  adjustable_transmission->adjustTransmissionOffset(new_offset);
+}
+```
+
+**Example: Implementing a Service to Adjust Offsets**
+
+The package provides the `AdjustTransmissionOffsets.srv` service definition, but you must implement the service server in your own code. Here's an example implementation:
+
+```cpp
+void adjustOffsetsCallback(
+  const hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Request::SharedPtr request,
+  hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Response::SharedPtr response)
+{
+  // Get current internal joint position from your robot state
+  double internal_joint_position = joint_state_interface->get_position();
+
+  // Get external measurement from service request
+  double external_joint_position = request->external_joint_measurements.position[joint_index];
+
+  // Access the transmission and calculate corrected offset
+  auto* adjustable_transmission = dynamic_cast<hector_transmission_interface::AdjustableOffsetTransmission*>(
+    transmission_manager->get(joint_name).get());
+
+  if (adjustable_transmission) {
+    double current_offset = adjustable_transmission->get_joint_offset();
+    double corrected_offset = external_joint_position - internal_joint_position + current_offset;
+
+    adjustable_transmission->adjustTransmissionOffset(corrected_offset);
+
+    response->adjusted_offsets.push_back(corrected_offset);
+    response->success = true;
+  } else {
+    response->success = false;
+    response->message = "Failed to cast transmission to AdjustableOffsetTransmission";
+  }
+}
+```
+
+Once your service is implemented, you can call it with:
 
 ```bash
 ros2 service call /adjust_transmission_offsets hector_transmission_interface_msgs/srv/AdjustTransmissionOffsets \
   "{external_joint_measurements: {name: ['joint1', 'joint2'], position: [1.57, -0.785]}}"
 ```
 
-The service compares external measurements with current joint states and calculates the required offset adjustments.
-
 #### Method 2: Direct File Modification
-Offsets can also be manually edited by modifying the text files in `~/.ros/dynamic_offset_transmissions/`, but this requires restarting the controller manager to take effect.
-
-#### Method 3: Programmatic API
-From C++ code, call `adjustTransmissionOffset(double offset)` on the transmission object:
-
-```cpp
-transmission->adjustTransmissionOffset(new_offset);
-```
+Offsets can be manually edited by modifying the text files in `~/.ros/dynamic_offset_transmissions/`. This requires restarting the controller manager to take effect and is not recommended for runtime adjustments.
 
 ### Important Safety Notes
 
@@ -75,3 +110,17 @@ transmission->adjustTransmissionOffset(new_offset);
 1. Stop all controllers using the affected joints
 2. Adjust the transmission offset(s)
 3. Restart the controllers
+
+## Service Message Definition
+
+The `AdjustTransmissionOffsets.srv` provides a standard interface for adjusting offsets:
+
+**Request:**
+- `sensor_msgs/JointState external_joint_measurements` - External measurements of joint positions
+
+**Response:**
+- `float64[] adjusted_offsets` - The new offset values that were set
+- `bool success` - Whether the operation succeeded
+- `string message` - Status message or error description
+
+**Note:** This library provides only the message definition. Service implementation is the responsibility of the library user and should be tailored to your specific hardware interface and calibration workflow.
