@@ -7,7 +7,7 @@ export_windows_symbols()
 
 set(THIS_PACKAGE_INCLUDE_DEPENDS
     pluginlib rclcpp transmission_interface controller_manager_msgs
-    controller_orchestrator hector_transmission_interface_msgs)
+    hector_transmission_interface_msgs)
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_gen_version_h REQUIRED)
