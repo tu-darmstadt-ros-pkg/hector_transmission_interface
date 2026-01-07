@@ -5,9 +5,9 @@
 #ifndef DYNAMIC_OFFSET_TRANSMISSION_HPP
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
-#include <controller_orchestrator/controller_orchestrator.hpp>
 #include <filesystem>
 #include <fstream>
+#include <rclcpp/rclcpp.hpp>
 #include <transmission_interface/simple_transmission.hpp>
 
 namespace hector_transmission_interface

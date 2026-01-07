@@ -15,7 +15,6 @@
 
   <depend>ament_cmake_gen_version_h</depend>
   <depend>controller_manager_msgs</depend>
-  <depend>controller_orchestrator</depend>
   <depend>hector_transmission_interface_msgs</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
