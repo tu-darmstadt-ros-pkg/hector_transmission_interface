@@ -20,7 +20,9 @@ private:
   std::shared_ptr<AdjustableOffsetTransmission> tx_;
 };
 
-AdjustableOffsetManager::AdjustableOffsetManager( rclcpp::Node::SharedPtr node ) : node_( node )
+AdjustableOffsetManager::AdjustableOffsetManager(
+    rclcpp::Node::SharedPtr node, std::optional<std::reference_wrapper<std::mutex>> comm_mutex )
+    : node_( node ), comm_mutex_( comm_mutex )
 {
   service_ = node_->create_service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>(
       "~/adjust_transmission_offsets", std::bind( &AdjustableOffsetManager::handle_service, this,
@@ -54,7 +56,14 @@ void AdjustableOffsetManager::handle_service(
     const std::shared_ptr<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Response>
         response )
 {
-  response->success = true;
+  // --- THREAD SAFETY ---
+  // Create a conditional lock. If the optional is set, we lock the referenced mutex.
+  std::unique_lock<std::mutex> lock;
+  if ( comm_mutex_.has_value() ) {
+    lock = std::unique_lock<std::mutex>( comm_mutex_->get() );
+    RCLCPP_DEBUG( node_->get_logger(), "Offset adjustment service locked hardware mutex." );
+  }
+
   response->success = false;
 
   // 1. Safety check for array bounds

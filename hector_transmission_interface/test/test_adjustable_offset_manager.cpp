@@ -1,3 +1,4 @@
+#include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -33,6 +34,24 @@ protected:
     ASSERT_NE( service, nullptr ) << "Service not found in rtest registry!";
   }
   rclcpp::Node::SharedPtr node_;
+  std::shared_ptr<AdjustableOffsetManager> manager_;
+};
+
+class AdjustableOffsetManagerTestMutex : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    node_ = std::make_shared<rclcpp::Node>( "test_node" );
+    manager_ = std::make_shared<AdjustableOffsetManager>( node_, std::ref( blocking_mutex ) );
+
+    // 1. Try to find the service. If it fails, stop the test immediately to avoid Segfault.
+    auto service =
+        rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+    ASSERT_NE( service, nullptr ) << "Service not found in rtest registry!";
+  }
+  rclcpp::Node::SharedPtr node_;
+  std::mutex blocking_mutex;
   std::shared_ptr<AdjustableOffsetManager> manager_;
 };
 
@@ -254,6 +273,103 @@ TEST_F( AdjustableOffsetManagerTest, MismatchedArraySizes )
   // Usually by iterating based on the smaller of the two sizes or the name size with a check.
   EXPECT_CALL( *service, send_response( *request_header, testing::_ ) ).Times( 1 );
 
+  service->handle_request( request_header, request );
+}
+
+/* Test: Mutex Locking Behavior
+ * Scenario: The manager is constructed with a mutex reference.
+ * We test that the service handler waits for the mutex to be released.
+ */
+TEST_F( AdjustableOffsetManagerTestMutex, VerifyServiceWaitsForMutex )
+{
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "locked_joint" };
+  request->external_joint_measurements.position = { 1.0 };
+
+  // 1. Grab the lock in the test thread
+  std::unique_lock<std::mutex> test_lock( blocking_mutex );
+
+  // 2. Launch service call in background
+  bool service_finished = false;
+  auto future = std::async( std::launch::async, [&]() {
+    service->handle_request( request_header, request );
+    service_finished = true;
+  } );
+
+  // 3. Wait a bit and verify the service is still blocked
+  std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+  EXPECT_FALSE( service_finished ) << "Service proceeded even though mutex was locked by test!";
+
+  // 4. Release lock and verify service finishes
+  test_lock.unlock();
+
+  // Use a timeout to avoid infinite hangs if the test fails
+  auto status = future.wait_for( std::chrono::seconds( 1 ) );
+  EXPECT_EQ( status, std::future_status::ready );
+  EXPECT_TRUE( service_finished );
+}
+
+/* Test: Full Offset Calculation with Mutex
+ * Scenario: Same as RobustOffsetCalculation but with mutex locking.
+ */
+TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
+{
+  auto mock_state = std::make_shared<MockAdjustableOffset>();
+  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
+  std::string joint_name = "flipper_joint";
+
+  // Logic: NewOffset = External(1.2) - Internal(1.0) + CurrentOffset(0.5) = 0.7
+  double current_internal_val = 1.0;
+  double old_offset = 0.5;
+  double external_meas = 1.2;
+  double expected_new_offset = 0.7;
+
+  // Setup Mock expectations for the internal transmission handles
+  EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( old_offset ) );
+  EXPECT_CALL( *mock_state, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
+  EXPECT_CALL( *mock_cmd, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
+
+  // Inject mocks into manager
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.state_handle = mock_state;
+  mj.command_handle = mock_cmd;
+  mj.position_getter = [&]() { return current_internal_val; };
+  manager_->add_managed_joint( joint_name, mj );
+
+  // Retrieve the service mock via rtest
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  ASSERT_TRUE( service );
+
+  // 1. Set up Request Header (rtest requirement)
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  request_header->sequence_number = 1L;
+
+  // 2. Set up Request Data
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name.push_back( joint_name );
+  request->external_joint_measurements.position.push_back( external_meas );
+
+  // 3. Set up Expected Response for validation
+  AdjustTransmissionOffsets::Response expected_response;
+  expected_response.success = true;
+  expected_response.adjusted_offsets.push_back( expected_new_offset );
+  // Optional: match message content if desired
+
+  // 4. Expect that the service will call send_response with the correct data
+  // Using ElementsAre to check the floating point vector content
+  EXPECT_CALL(
+      *service,
+      send_response( *request_header,
+                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, true ),
+                                     Field( &AdjustTransmissionOffsets::Response::adjusted_offsets,
+                                            ElementsAre( DoubleEq( expected_new_offset ) ) ) ) ) );
+
+  // 5. Simulate the service call
   service->handle_request( request_header, request );
 }
 

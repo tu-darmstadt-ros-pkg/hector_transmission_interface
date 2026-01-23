@@ -3,6 +3,8 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -37,7 +39,14 @@ public:
     PositionGetter position_getter;
   };
 
-  explicit AdjustableOffsetManager( rclcpp::Node::SharedPtr node );
+  /**
+   * @brief Construct the manager
+   * @param node The node to host the service
+   * @param comm_mutex Optional reference to the hardware communication mutex
+   */
+  explicit AdjustableOffsetManager(
+      rclcpp::Node::SharedPtr node,
+      std::optional<std::reference_wrapper<std::mutex>> comm_mutex = std::nullopt );
 
   /**
    * @brief Adds a joint. Internally wraps the transmission in an adapter.
@@ -60,6 +69,8 @@ private:
           response );
 
   rclcpp::Node::SharedPtr node_;
+  // Optional reference wrapper: safe, non-owning, and clearly expresses intent
+  std::optional<std::reference_wrapper<std::mutex>> comm_mutex_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
 };
