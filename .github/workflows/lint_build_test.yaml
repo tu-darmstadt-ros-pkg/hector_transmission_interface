@@ -55,6 +55,10 @@ jobs:
         path: src/hector_ros2_utils
     - uses: actions/checkout@v4
       with:
+        repository: Beam-and-Spyrosoft/rtest
+        path: src/rtest
+    - uses: actions/checkout@v4
+      with:
         path: src/repo
     - name: rosdep
       run: |
