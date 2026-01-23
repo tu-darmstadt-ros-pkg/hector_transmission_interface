@@ -1,5 +1,5 @@
 # hector_transmission_interface
-![Lint](https://github.com/tu-darmstadt-ros-pkg/hector_transmission_interface/actions/workflows/lint_build_test.yaml/badge.svg)
+![Lint, Build & Test](https://github.com/tu-darmstadt-ros-pkg/hector_transmission_interface/actions/workflows/lint_build_test.yaml/badge.svg)
 
 A ROS 2 package providing an adjustable offset transmission interface for handling transmission offsets that can change during runtime, such as when a belt or chain slips.
 
@@ -111,16 +111,94 @@ Offsets can be manually edited by modifying the text files in `~/.ros/dynamic_of
 2. Adjust the transmission offset(s)
 3. Restart the controllers
 
+## AdjustableOffsetManager
+
+### Overview
+The `AdjustableOffsetManager` provides a convenient interface for managing multiple adjustable offset transmissions in a hardware interface. It handles the registration of joints and provides a standardized service for adjusting offsets across all managed transmissions.
+
+### Using AdjustableOffsetManager in a Hardware Interface
+
+The `AdjustableOffsetManager` should be created and used within your hardware interface implementation. **Important**: The manager requires a ROS 2 node that is actively spinning (running in an executor). This is typically the node of your hardware interface itself.
+
+#### Basic Setup
+
+```cpp
+#include "hector_transmission_interface/adjustable_offset_manager.hpp"
+
+class MyHardwareInterface : public hardware_interface::SystemInterface
+{
+public:
+  on_configure(const rclcpp_lifecycle::State& previous_state) override
+  {
+    // Create the manager with your node
+    auto lifecycle_node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("my_hardware");
+    offset_manager_ = std::make_shared<hector_transmission_interface::AdjustableOffsetManager>(lifecycle_node);
+
+    // Register your adjustable offset transmissions
+    for (const auto& transmission : transmissions_) {
+      // Get the transmission from your system
+      auto state_transmission = ...;      // Your state transmission
+      auto command_transmission = ...;    // Your command transmission
+
+      // Define a lambda to get the current position
+      auto get_position = [this, index]() {
+        return joint_state_handles_[index].position.get().get();
+      };
+
+      // Add the joint to the manager
+      offset_manager_->add_joint(joint_name, state_transmission, command_transmission, get_position);
+    }
+
+    return CallbackReturn::SUCCESS;
+  }
+
+private:
+  std::shared_ptr<hector_transmission_interface::AdjustableOffsetManager> offset_manager_;
+};
+```
+
+**Key Requirements:**
+1. The node must be spinning in an executor (this is usually handled automatically by your hardware interface's lifecycle)
+2. The `PositionGetter` callback must return the current joint position from your state interface
+3. Both state and command transmissions must be provided
+
+The manager automatically creates a ROS 2 service (`/adjust_transmission_offsets`) that can be called to adjust offsets on all managed joints.
+
 ## Service Message Definition
 
 The `AdjustTransmissionOffsets.srv` provides a standard interface for adjusting offsets:
 
 **Request:**
-- `sensor_msgs/JointState external_joint_measurements` - External measurements of joint positions
+- `sensor_msgs/JointState external_joint_measurements` - External measurements of joint positions (typically from an external sensor or calibration procedure)
+- `sensor_msgs/JointState original_joint_state` (optional) - The original joint state at the time the external measurements were taken. Used when calibration is not instantaneous. If not provided, the current joint state from the transmission interface will be used.
 
 **Response:**
 - `float64[] adjusted_offsets` - The new offset values that were set
 - `bool success` - Whether the operation succeeded
 - `string message` - Status message or error description
 
-**Note:** This library provides only the message definition. Service implementation is the responsibility of the library user and should be tailored to your specific hardware interface and calibration workflow.
+### Using original_joint_state for Non-Instant Calibration
+
+When your calibration procedure takes time or involves joint movement, you can use the `original_joint_state` field to provide the joint positions that were current when the external measurements were taken:
+
+```cpp
+// Example: Calibration procedure that takes multiple seconds
+auto request = std::make_shared<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Request>();
+
+// Record the joint state at the beginning of calibration
+sensor_msgs::msg::JointState original_state = get_current_joint_state();
+
+// ... perform external measurements (which may take time) ...
+sensor_msgs::msg::JointState external_measurements = get_external_measurements();
+
+// When calling the service, provide both measurements
+request->original_joint_state = original_state;  // Joint state during calibration
+request->external_joint_measurements = external_measurements;  // External sensor readings
+
+// The offset calculation will use the original state instead of current state
+```
+
+This allows the offset calculation to be more accurate:
+- **offset_correction = external_position - original_position + current_offset**
+
+Instead of using the current position (which may have changed), the original position is used.
