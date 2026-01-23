@@ -14,34 +14,43 @@
 
 namespace hector_transmission_interface
 {
+/**
+ * @brief Interface to allow mocking of offset adjustments regardless of
+ * concrete transmission implementation.
+ */
+class IAdjustableOffset
+{
+public:
+  virtual ~IAdjustableOffset() = default;
+  virtual void adjustOffset( double offset ) = 0;
+  virtual double getOffset() const = 0;
+};
+
 class AdjustableOffsetManager
 {
 public:
   using PositionGetter = std::function<double()>;
 
   struct ManagedJoint {
-    std::shared_ptr<AdjustableOffsetTransmission> state_transmission;
-    std::shared_ptr<AdjustableOffsetTransmission> command_transmission;
+    std::shared_ptr<IAdjustableOffset> state_handle;
+    std::shared_ptr<IAdjustableOffset> command_handle;
     PositionGetter position_getter;
   };
 
-  /**
-   * @brief Construct a new Adjustable Offset Manager
-   * @param node Shared pointer to a node for service creation and logging
-   */
   explicit AdjustableOffsetManager( rclcpp::Node::SharedPtr node );
 
   /**
-   * @brief Adds a joint to the manager if it uses AdjustableOffsetTransmissions
-   * @param name Name of the joint
-   * @param state_tx The state transmission instance
-   * @param command_tx The command transmission instance
-   * @param position_getter A functional callback returning the current joint position
+   * @brief Adds a joint. Internally wraps the transmission in an adapter.
    */
   void add_joint( const std::string &name,
                   std::shared_ptr<transmission_interface::Transmission> state_tx,
                   std::shared_ptr<transmission_interface::Transmission> command_tx,
                   PositionGetter position_getter );
+
+  /**
+   * @brief Direct injection for testing purposes.
+   */
+  void add_managed_joint( const std::string &name, ManagedJoint mj );
 
 private:
   void handle_service(
@@ -57,4 +66,4 @@ private:
 
 } // namespace hector_transmission_interface
 
-#endif // HECTOR_TRANSMISSION_INTERFACE__ADJUSTABLE_OFFSET_MANAGER_HPP_
+#endif

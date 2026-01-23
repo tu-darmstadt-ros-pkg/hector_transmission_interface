@@ -2,6 +2,24 @@
 
 namespace hector_transmission_interface
 {
+/**
+ * @brief Concrete adapter mapping the interface to the non-virtual transmission methods.
+ */
+class AdjustableTransmissionAdapter : public IAdjustableOffset
+{
+public:
+  explicit AdjustableTransmissionAdapter( std::shared_ptr<AdjustableOffsetTransmission> tx )
+      : tx_( tx )
+  {
+  }
+
+  void adjustOffset( double offset ) override { tx_->adjustTransmissionOffset( offset ); }
+  double getOffset() const override { return tx_->get_joint_offset(); }
+
+private:
+  std::shared_ptr<AdjustableOffsetTransmission> tx_;
+};
+
 AdjustableOffsetManager::AdjustableOffsetManager( rclcpp::Node::SharedPtr node ) : node_( node )
 {
   service_ = node_->create_service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>(
@@ -18,13 +36,17 @@ void AdjustableOffsetManager::add_joint(
 
   if ( adj_state && adj_cmd ) {
     ManagedJoint mj;
-    mj.state_transmission = adj_state;
-    mj.command_transmission = adj_cmd;
+    mj.state_handle = std::make_shared<AdjustableTransmissionAdapter>( adj_state );
+    mj.command_handle = std::make_shared<AdjustableTransmissionAdapter>( adj_cmd );
     mj.position_getter = position_getter;
-    managed_joints_[name] = mj;
-    RCLCPP_INFO( node_->get_logger(), "Registered joint '%s' for adjustable offset calibration.",
-                 name.c_str() );
+    add_managed_joint( name, mj );
+    RCLCPP_INFO( node_->get_logger(), "Registered joint '%s' via adapter.", name.c_str() );
   }
+}
+
+void AdjustableOffsetManager::add_managed_joint( const std::string &name, ManagedJoint mj )
+{
+  managed_joints_[name] = mj;
 }
 
 void AdjustableOffsetManager::handle_service(
@@ -32,63 +54,55 @@ void AdjustableOffsetManager::handle_service(
     const std::shared_ptr<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Response>
         response )
 {
-  RCLCPP_INFO( node_->get_logger(), "Request to adjust transmission offsets received." );
   response->success = true;
+  response->success = false;
 
-  for ( size_t i = 0; i < request->external_joint_measurements.name.size(); ++i ) {
+  // 1. Safety check for array bounds
+  size_t num_measurements = std::min( request->external_joint_measurements.name.size(),
+                                      request->external_joint_measurements.position.size() );
+
+  for ( size_t i = 0; i < num_measurements; ++i ) {
     const std::string &joint_name = request->external_joint_measurements.name[i];
+    double external_pos = request->external_joint_measurements.position[i];
 
-    auto it = managed_joints_.find( joint_name );
-    if ( it == managed_joints_.end() ) {
-      RCLCPP_WARN( node_->get_logger(), "Joint '%s' is not managed or not adjustable.",
-                   joint_name.c_str() );
+    // 2. Skip NaNs
+    if ( !std::isfinite( external_pos ) ) {
+      RCLCPP_WARN( node_->get_logger(), "Received NaN for joint %s, skipping.", joint_name.c_str() );
       continue;
     }
 
+    auto it = managed_joints_.find( joint_name );
+    if ( it == managed_joints_.end() )
+      continue;
+
     auto &mj = it->second;
-    double external_pos = request->external_joint_measurements.position[i];
     double internal_pos = 0.0;
     bool found_internal = false;
 
-    // Check if optional original joint state is provided
     if ( !request->original_joint_state.name.empty() ) {
       for ( size_t j = 0; j < request->original_joint_state.name.size(); ++j ) {
         if ( request->original_joint_state.name[j] == joint_name ) {
           internal_pos = request->original_joint_state.position[j];
-          found_internal = true;
+          found_internal = std::isfinite( internal_pos );
           break;
         }
       }
     }
 
-    // Fallback to current state via the functional getter
-    if ( !found_internal ) {
-      if ( mj.position_getter ) {
-        internal_pos = mj.position_getter();
-      } else {
-        RCLCPP_ERROR( node_->get_logger(), "No position getter for joint '%s'", joint_name.c_str() );
-        continue;
-      }
-    }
+    if ( !found_internal )
+      internal_pos = mj.position_getter();
 
-    // Logic: New Offset = ExternalPos - (InternalPos - OldOffset)
-    double current_offset = mj.state_transmission->get_joint_offset();
-    double corrected_offset = external_pos - internal_pos + current_offset;
+    double current_offset = mj.state_handle->getOffset();
+    double corrected_offset =
+        request->external_joint_measurements.position[i] - internal_pos + current_offset;
 
-    mj.state_transmission->adjustTransmissionOffset( corrected_offset );
-    mj.command_transmission->adjustTransmissionOffset( corrected_offset );
+    mj.state_handle->adjustOffset( corrected_offset );
+    mj.command_handle->adjustOffset( corrected_offset );
 
     response->adjusted_offsets.push_back( corrected_offset );
-    RCLCPP_INFO( node_->get_logger(), "Adjusted offset for joint '%s' to %f", joint_name.c_str(),
-                 corrected_offset );
   }
-
-  if ( response->adjusted_offsets.empty() ) {
-    response->success = false;
-    response->message = "No offsets were adjusted. Check joint names.";
-  } else {
-    response->message = "Offsets adjusted successfully";
-  }
+  response->message = response->adjusted_offsets.empty() ? "No joints adjusted" : "Success";
+  response->success = !response->adjusted_offsets.empty();
 }
 
 } // namespace hector_transmission_interface
