@@ -7,7 +7,7 @@ export_windows_symbols()
 
 set(THIS_PACKAGE_INCLUDE_DEPENDS
     pluginlib rclcpp transmission_interface controller_manager_msgs
-    hector_transmission_interface_msgs)
+    hector_transmission_interface_msgs sensor_msgs) # Added sensor_msgs
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_gen_version_h REQUIRED)
@@ -15,18 +15,18 @@ foreach(dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
   find_package(${dependency} REQUIRED)
 endforeach()
 
-add_library(hector_transmission_interface SHARED
-            src/adjustable_offset_transmission_loader.cpp)
+add_library(
+  hector_transmission_interface SHARED
+  src/adjustable_offset_transmission_loader.cpp
+  src/adjustable_offset_manager.cpp) # Added manager source
+
 target_include_directories(
   hector_transmission_interface
   PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
          $<INSTALL_INTERFACE:include/hector_transmission_interface>)
+
 ament_target_dependencies(hector_transmission_interface
                           ${THIS_PACKAGE_INCLUDE_DEPENDS})
-#[[target_link_libraries(
-        hector_transmission_interface
-        PUBLIC transmission_interface pluginlib
-        rclcpp)]]
 
 pluginlib_export_plugin_description_file(hector_transmission_interface
                                          ros2_control_plugins.xml)
@@ -40,7 +40,8 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_adjustable_offset_transmission rclcpp
                             transmission_interface)
 endif()
-install(DIRECTORY include/ DESTINATION include/hector_transmission_interface)
+
+install(DIRECTORY include/ DESTINATION include/)
 install(
   TARGETS hector_transmission_interface
   EXPORT export_hector_transmission_interface
