@@ -24,6 +24,7 @@ jobs:
       with:
         extra_args: --all-files
 
+
   build-and-test:
     needs: Linting
     strategy:
@@ -70,19 +71,18 @@ jobs:
     - name: Identify Local Packages
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        # Flatten newlines to spaces
-        PKGS=$(colcon list --names-only --base-paths src/${{ github.event.repository.name }} | tr '\n' ' ')
+        # xargs trims whitespace and ensures the list is space-separated
+        PKGS=$(colcon list --names-only --base-paths src/${{ github.event.repository.name }} | tr '\n' ' ' | xargs)
+
         if [ -z "$PKGS" ]; then
-          echo "::error::No packages found in src/${{ github.event.repository.name }}"
+          echo "::error::No packages found. Check if the repo name matches folder name."
           exit 1
         fi
         echo "LOCAL_PKGS=$PKGS" >> $GITHUB_ENV
-        echo "Found packages: $PKGS"
 
     - name: Build Local Packages
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        # Use shell variable $LOCAL_PKGS for reliability within the same job
         colcon build --packages-up-to $LOCAL_PKGS --event-handlers console_direct+
 
     - name: Test Local Packages
@@ -94,5 +94,4 @@ jobs:
       if: always()
       run: |
         source /opt/ros/${{ matrix.setup.rosdistro }}/setup.bash
-        # verbose shows exactly which tests failed
         colcon test-result --verbose
