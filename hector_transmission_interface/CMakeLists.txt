@@ -71,6 +71,17 @@ if(BUILD_TESTING)
 
   target_include_directories(test_adjustable_offset_manager
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+  find_package(hector_testing_utils REQUIRED)
+  ament_add_gtest(test_offset_manager_integration
+                  test/test_offset_manager_integration.cpp)
+  target_link_libraries(
+    test_offset_manager_integration ${PROJECT_NAME} ${rclcpp_LIBRARIES}
+    hector_testing_utils::hector_testing_utils)
+  ament_target_dependencies(test_offset_manager_integration rclcpp
+                            hardware_interface transmission_interface)
+  target_include_directories(test_offset_manager_integration
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endif()
 
 # --- Installation & Export ---
