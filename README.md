@@ -49,24 +49,49 @@ To avoid data corruption or "jumps" during an update, the manager uses
 
 // 1. Initialize with a reference to your Hardware Interface mutex
 // This ensures the service blocks the HW thread during the update.
+hardware_interface::CallbackReturn
+DynamixelHardwareInterface::on_configure(const rclcpp_lifecycle::State& previous_state){
 offset_manager_ = std::make_unique<AdjustableOffsetManager>(node_ptr, comm_mutex_);
-
 // You can additionally pass pre- and post-update callbacks if needed:
 // offset_manager_ = std::make_unique<AdjustableOffsetManager>(
 //     node_ptr, comm_mutex_, pre_update_callback, post_update_callback
 // ); // with signatures: std::function<bool()>
-
-// 2. Register joints with a lambda getter for live state variables
-for (auto& joint : my_joints) {
-    offset_manager_->add_joint(
-        joint.name,
-        joint.state_transmission,
-        joint.command_transmission,
-        [&joint]() { return joint.position_state; }
-    );
+...
 }
 
-// make sure to block the hardware thread in your read()/write() methods
+// 2. Register State Interfaces
+std::vector<hardware_interface::StateInterface::ConstSharedPtr> DynamixelHardwareInterface::on_export_state_interfaces()
+{
+  // create state interfaces
+  ...
+  // setup transmissions
+  ...
+  // register transmissions with offset manager
+  for (const auto& [name, joint] : joints_) {
+    // try to register only adjustable offset transmissions
+    offset_manager_->add_joint_state_interface(name, joint.state_transmission, [&joint]() {
+      return joint.joint_state.current.at(hardware_interface::HW_IF_POSITION);
+    });
+  }
+  return state_interfaces;
+}
+
+// 3. Register Command Interfaces
+std::vector<hardware_interface::CommandInterface::SharedPtr> DynamixelHardwareInterface::on_export_command_interfaces()
+{
+  // create command interfaces
+  ...
+  /// setup transmissions
+  ...
+  /// register transmissions with offset manager
+  for (const auto& [name, joint] : joints_) {
+    // try to register only adjustable offset transmissions
+    offset_manager_->add_joint_command_interface(name, joint.command_transmission);
+  }
+  return command_interfaces;
+}
+
+// 4. make sure to block the hardware thread in your read()/write() methods
 void MyHardwareInterface::read() {
 
   std::unique_lock<std::mutex> lock(dynamixel_comm_mutex_, std::try_to_lock);
