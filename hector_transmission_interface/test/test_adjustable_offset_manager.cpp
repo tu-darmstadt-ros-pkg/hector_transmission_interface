@@ -372,6 +372,206 @@ TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
   // 5. Simulate the service call
   service->handle_request( request_header, request );
 }
+class AdjustableOffsetManagerTestCallbacks : public ::testing::Test
+{
+protected:
+  void SetUp() override { node_ = std::make_shared<rclcpp::Node>( "test_node" ); }
+  rclcpp::Node::SharedPtr node_;
+};
+
+/**
+ * Test: Pre-callback returning false aborts service
+ */
+TEST_F( AdjustableOffsetManagerTestCallbacks, PreCallbackReturnsFalseAbortsService )
+{
+  bool pre_called = false;
+  auto pre_callback = [&pre_called]() {
+    pre_called = true;
+    return false; // Abort
+  };
+
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::make_optional( pre_callback ), std::nullopt );
+
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.state_handle = mj.command_handle = mock;
+  mj.position_getter = []() { return 1.0; };
+  manager->add_managed_joint( "test_joint", mj );
+
+  // adjustOffset should NOT be called if pre-callback returns false
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 0 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  ASSERT_TRUE( service );
+
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "test_joint" };
+  request->external_joint_measurements.position = { 1.5 };
+
+  EXPECT_CALL(
+      *service,
+      send_response( *request_header,
+                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, false ),
+                                     Field( &AdjustTransmissionOffsets::Response::message,
+                                            testing::HasSubstr( "Pre-callback" ) ) ) ) );
+
+  service->handle_request( request_header, request );
+  EXPECT_TRUE( pre_called );
+}
+
+/**
+ * Test: Pre-callback returning true allows processing
+ */
+TEST_F( AdjustableOffsetManagerTestCallbacks, PreCallbackReturnsTrueAllowsProcessing )
+{
+  bool pre_called = false;
+  auto pre_callback = [&pre_called]() {
+    pre_called = true;
+    return true; // Continue
+  };
+
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::make_optional( pre_callback ), std::nullopt );
+
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.state_handle = mj.command_handle = mock;
+  mj.position_getter = []() { return 1.0; };
+  manager->add_managed_joint( "test_joint", mj );
+
+  EXPECT_CALL( *mock, getOffset() ).WillOnce( Return( 0.0 ) );
+  EXPECT_CALL( *mock, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 2 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "test_joint" };
+  request->external_joint_measurements.position = { 1.5 };
+
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, true ) ) );
+
+  service->handle_request( request_header, request );
+  EXPECT_TRUE( pre_called );
+}
+
+/**
+ * Test: Post-callback is called after successful processing
+ */
+TEST_F( AdjustableOffsetManagerTestCallbacks, PostCallbackCalledAfterProcessing )
+{
+  bool post_called = false;
+  auto post_callback = [&post_called]() {
+    post_called = true;
+    return true;
+  };
+
+  auto manager = std::make_shared<AdjustableOffsetManager>( node_, std::nullopt, std::nullopt,
+                                                            std::make_optional( post_callback ) );
+
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.state_handle = mj.command_handle = mock;
+  mj.position_getter = []() { return 1.0; };
+  manager->add_managed_joint( "test_joint", mj );
+
+  EXPECT_CALL( *mock, getOffset() ).WillOnce( Return( 0.0 ) );
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 2 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "test_joint" };
+  request->external_joint_measurements.position = { 1.5 };
+
+  EXPECT_CALL( *service, send_response( *request_header, testing::_ ) );
+
+  service->handle_request( request_header, request );
+  EXPECT_TRUE( post_called );
+}
+
+/**
+ * Test: Post-callback NOT called when pre-callback aborts
+ */
+TEST_F( AdjustableOffsetManagerTestCallbacks, PostCallbackNotCalledWhenPreAborts )
+{
+  bool pre_called = false;
+  bool post_called = false;
+  auto pre_callback = [&pre_called]() {
+    pre_called = true;
+    return false;
+  };
+  auto post_callback = [&post_called]() {
+    post_called = true;
+    return true;
+  };
+
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::make_optional( pre_callback ), std::make_optional( post_callback ) );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "any" };
+  request->external_joint_measurements.position = { 1.0 };
+
+  EXPECT_CALL( *service, send_response( *request_header, testing::_ ) );
+
+  service->handle_request( request_header, request );
+  EXPECT_TRUE( pre_called );
+  EXPECT_FALSE( post_called );
+}
+
+/**
+ * Test: Both callbacks with full processing
+ */
+TEST_F( AdjustableOffsetManagerTestCallbacks, BothCallbacksExecuteInOrder )
+{
+  int call_order = 0;
+  int pre_order = 0, post_order = 0;
+
+  auto pre_callback = [&]() {
+    pre_order = ++call_order;
+    return true;
+  };
+  auto post_callback = [&]() {
+    post_order = ++call_order;
+    return true;
+  };
+
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::make_optional( pre_callback ), std::make_optional( post_callback ) );
+
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.state_handle = mj.command_handle = mock;
+  mj.position_getter = []() { return 1.0; };
+  manager->add_managed_joint( "test_joint", mj );
+
+  EXPECT_CALL( *mock, getOffset() ).WillOnce( Return( 0.0 ) );
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 2 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "test_joint" };
+  request->external_joint_measurements.position = { 1.5 };
+
+  EXPECT_CALL( *service, send_response( *request_header, testing::_ ) );
+
+  service->handle_request( request_header, request );
+
+  EXPECT_EQ( pre_order, 1 );
+  EXPECT_EQ( post_order, 2 );
+}
 
 int main( int argc, char **argv )
 {

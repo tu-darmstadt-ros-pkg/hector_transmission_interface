@@ -21,8 +21,10 @@ private:
 };
 
 AdjustableOffsetManager::AdjustableOffsetManager(
-    rclcpp::Node::SharedPtr node, std::optional<std::reference_wrapper<std::mutex>> comm_mutex )
-    : node_( node ), comm_mutex_( comm_mutex )
+    rclcpp::Node::SharedPtr node, std::optional<std::reference_wrapper<std::mutex>> comm_mutex,
+    std::optional<ServiceCallback> pre_callback, std::optional<ServiceCallback> post_callback )
+    : node_( node ), comm_mutex_( comm_mutex ), pre_callback_( pre_callback ),
+      post_callback_( post_callback )
 {
   service_ = node_->create_service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>(
       "~/adjust_transmission_offsets", std::bind( &AdjustableOffsetManager::handle_service, this,
@@ -56,6 +58,16 @@ void AdjustableOffsetManager::handle_service(
     const std::shared_ptr<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Response>
         response )
 {
+  // --- PRE CALLBACK ---
+  if ( pre_callback_.has_value() ) {
+    if ( !pre_callback_.value()() ) {
+      RCLCPP_WARN( node_->get_logger(), "Pre-callback returned false, aborting service call." );
+      response->success = false;
+      response->message = "Pre-callback failed";
+      return;
+    }
+  }
+
   // --- THREAD SAFETY ---
   // Create a conditional lock. If the optional is set, we lock the referenced mutex.
   std::unique_lock<std::mutex> lock;
@@ -112,6 +124,12 @@ void AdjustableOffsetManager::handle_service(
   }
   response->message = response->adjusted_offsets.empty() ? "No joints adjusted" : "Success";
   response->success = !response->adjusted_offsets.empty();
-}
 
+  // --- POST CALLBACK ---
+  if ( post_callback_.has_value() ) {
+    if ( !post_callback_.value()() ) {
+      RCLCPP_WARN( node_->get_logger(), "Post-callback returned false." );
+    }
+  }
+}
 } // namespace hector_transmission_interface

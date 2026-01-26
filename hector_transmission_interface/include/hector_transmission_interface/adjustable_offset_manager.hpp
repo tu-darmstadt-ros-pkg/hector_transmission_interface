@@ -32,6 +32,7 @@ class AdjustableOffsetManager
 {
 public:
   using PositionGetter = std::function<double()>;
+  using ServiceCallback = std::function<bool()>;
 
   struct ManagedJoint {
     std::shared_ptr<IAdjustableOffset> state_handle;
@@ -43,10 +44,14 @@ public:
    * @brief Construct the manager
    * @param node The node to host the service
    * @param comm_mutex Optional reference to the hardware communication mutex
+   * @param pre_callback Optional callback invoked before service processing (aborts if returns false)
+   * @param post_callback Optional callback invoked after service processing
    */
   explicit AdjustableOffsetManager(
       rclcpp::Node::SharedPtr node,
-      std::optional<std::reference_wrapper<std::mutex>> comm_mutex = std::nullopt );
+      std::optional<std::reference_wrapper<std::mutex>> comm_mutex = std::nullopt,
+      std::optional<ServiceCallback> pre_callback = std::nullopt,
+      std::optional<ServiceCallback> post_callback = std::nullopt );
 
   /**
    * @brief Adds a joint. Internally wraps the transmission in an adapter.
@@ -71,6 +76,8 @@ private:
   rclcpp::Node::SharedPtr node_;
   // Optional reference wrapper: safe, non-owning, and clearly expresses intent
   std::optional<std::reference_wrapper<std::mutex>> comm_mutex_;
+  std::optional<ServiceCallback> pre_callback_;
+  std::optional<ServiceCallback> post_callback_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
 };

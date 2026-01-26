@@ -51,6 +51,11 @@ To avoid data corruption or "jumps" during an update, the manager uses
 // This ensures the service blocks the HW thread during the update.
 offset_manager_ = std::make_unique<AdjustableOffsetManager>(node_ptr, comm_mutex_);
 
+// You can additionally pass pre- and post-update callbacks if needed:
+// offset_manager_ = std::make_unique<AdjustableOffsetManager>(
+//     node_ptr, comm_mutex_, pre_update_callback, post_update_callback
+// ); // with signatures: std::function<bool()>
+
 // 2. Register joints with a lambda getter for live state variables
 for (auto& joint : my_joints) {
     offset_manager_->add_joint(
