@@ -113,6 +113,7 @@ inline void AdjustableOffsetTransmission::adjustTransmissionOffset( double offse
 {
   jnt_offset_ = offset;
   saveTransmissionOffset();
+  actuator_to_joint(); // update joint state based on new offset
 }
 } // namespace hector_transmission_interface
 #endif // DYNAMIC_OFFSET_TRANSMISSION_HPP

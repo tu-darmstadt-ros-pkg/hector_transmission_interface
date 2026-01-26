@@ -1,5 +1,4 @@
-#ifndef HECTOR_TRANSMISSION_INTERFACE__ADJUSTABLE_OFFSET_MANAGER_HPP_
-#define HECTOR_TRANSMISSION_INTERFACE__ADJUSTABLE_OFFSET_MANAGER_HPP_
+#pragma once
 
 #include <functional>
 #include <memory>
@@ -7,19 +6,14 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "hector_transmission_interface/adjustable_offset_transmission.hpp"
 #include "hector_transmission_interface_msgs/srv/adjust_transmission_offsets.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "sensor_msgs/msg/joint_state.hpp"
 
 namespace hector_transmission_interface
 {
-/**
- * @brief Interface to allow mocking of offset adjustments regardless of
- * concrete transmission implementation.
- */
+
 class IAdjustableOffset
 {
 public:
@@ -40,13 +34,6 @@ public:
     PositionGetter position_getter;
   };
 
-  /**
-   * @brief Construct the manager
-   * @param node The node to host the service
-   * @param comm_mutex Optional reference to the hardware communication mutex
-   * @param pre_callback Optional callback invoked before service processing (aborts if returns false)
-   * @param post_callback Optional callback invoked after service processing
-   */
   explicit AdjustableOffsetManager(
       rclcpp::Node::SharedPtr node,
       std::optional<std::reference_wrapper<std::mutex>> comm_mutex = std::nullopt,
@@ -54,16 +41,23 @@ public:
       std::optional<ServiceCallback> post_callback = std::nullopt );
 
   /**
-   * @brief Adds a joint. Internally wraps the transmission in an adapter.
+   * @brief Add state interface for a joint
+   * @param name Joint name
+   * @param state_tx State transmission
+   * @param position_getter Function to get current position
    */
-  void add_joint( const std::string &name,
-                  std::shared_ptr<transmission_interface::Transmission> state_tx,
-                  std::shared_ptr<transmission_interface::Transmission> command_tx,
-                  PositionGetter position_getter );
+  void add_joint_state_interface( const std::string &name,
+                                  std::shared_ptr<transmission_interface::Transmission> state_tx,
+                                  PositionGetter position_getter );
 
   /**
-   * @brief Direct injection for testing purposes.
+   * @brief Add command interface for a joint
+   * @param name Joint name
+   * @param command_tx Command transmission
    */
+  void add_joint_command_interface( const std::string &name,
+                                    std::shared_ptr<transmission_interface::Transmission> command_tx );
+
   void add_managed_joint( const std::string &name, ManagedJoint mj );
 
 private:
@@ -74,14 +68,11 @@ private:
           response );
 
   rclcpp::Node::SharedPtr node_;
-  // Optional reference wrapper: safe, non-owning, and clearly expresses intent
   std::optional<std::reference_wrapper<std::mutex>> comm_mutex_;
   std::optional<ServiceCallback> pre_callback_;
   std::optional<ServiceCallback> post_callback_;
-  rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
+  rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
 };
 
 } // namespace hector_transmission_interface
-
-#endif
