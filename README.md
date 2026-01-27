@@ -1,126 +1,161 @@
 # hector_transmission_interface
-![Lint](https://github.com/tu-darmstadt-ros-pkg/hector_transmission_interface/actions/workflows/lint_build_test.yaml/badge.svg)
 
-A ROS 2 package providing an adjustable offset transmission interface for handling transmission offsets that can change during runtime, such as when a belt or chain slips.
+![Lint, Build & Test](https://github.com/tu-darmstadt-ros-pkg/hector_transmission_interface/actions/workflows/lint_build_test.yaml/badge.svg)
 
-## Adjustable Offset Transmission
+Here is the comprehensive, final version of the `README.md`. It combines all the technical details, the persistence
+logic, the `AdjustableOffsetManager` usage with mutex protection, and clear safety guidelines.
 
-### Overview
-Extends the standard `transmission_interface::SimpleTransmission` to support persistent storage and runtime adjustment of joint offsets. This is particularly useful for detecting and correcting slipping of transmissions (e.g., belts, chains) without restarting the system.
+`hector_transmission_interface` provides an **Adjustable Offset Transmission** for `ros2_control`. It is designed for
+systems where the relationship between an actuator and a joint can change during runtime (e.g., belt slip) or where the
+relationship is ambiguous upon startup (e.g., relative encoders on an actuator).
 
-### Features
-- **Persistent Storage**: Offsets are automatically saved to disk and restored on startup
-- **Runtime Adjustment**: Offsets can be modified during operation via service calls
-- **Per-Joint Configuration**: Each joint maintains its own independent offset file
+---
 
-### How It Works
+## ⚙️ Adjustable Offset Transmission
 
-#### Offset Storage Location
-Offsets are stored persistently in the filesystem at:
-```
-~/.ros/dynamic_offset_transmissions/<joint_name>.txt
-```
+### 💾 Persistence & Ambiguity Resolution
 
-Each joint has its own text file containing a single floating-point value representing the current offset. The directory is automatically created if it doesn't exist.
+This package is critical for robots with **Relative Actuator Encoders** (e.g., motors with incremental encoders placed
+before a high-ratio gearbox) that lack absolute joint sensing.
 
-#### Initialization Behavior
-When a transmission is loaded:
-1. If an offset file exists for the joint, it loads the saved offset value
-2. If no file exists, it uses the offset specified in the URDF and creates a new file
-3. The transmission logs any offset changes during initialization
+* **The Ambiguity Problem**: If a robot is moved while powered off, the relationship between the motor's zero-point and
+  the joint's physical zero-point is lost. Standard transmissions assume the current position is "Zero" on startup,
+  leading to kinematic errors.
+* **The Solution**: This transmission loads the last known "Good" offset from
+  `~/.ros/dynamic_offset_transmissions/<joint_name>.txt` on startup. If the robot was moved while off, a quick
+  calibration (Visual, Laser, or Mechanical Jig) can be used to update the offset via service call without restarting.
 
-#### Configuration in URDF
-To use the adjustable offset transmission, specify it in your robot's URDF/xacro:
+### 🛠 How It Works
 
-```xml
-<ros2_control>
-  <transmission name="my_joint_transmission">
-    <plugin>hector_transmission_interface/AdjustableOffsetTransmissionLoader</plugin>
-    <joint name="my_joint" role="joint1">
-      <mechanical_reduction>1.0</mechanical_reduction>
-      <offset>0.0</offset>  <!-- Initial offset, will be overridden by saved value if it exists -->
-    </joint>
-    <actuator name="my_actuator" role="actuator1"/>
-  </transmission>
-</ros2_control>
-```
+The transmission applies an offset to raw actuator data. New offsets are calculated as:
 
-### Adjusting Offsets
+---
 
-#### Method 1: Programmatic API (Primary Method)
-Access the transmission object from your hardware interface and call `adjustTransmissionOffset()`:
+## 🚀 AdjustableOffsetManager
+
+The `AdjustableOffsetManager` automates joint registration and provides a standardized ROS 2 service to calibrate
+multiple joints at once.
+
+### 🔒 Thread Safety (Recommended)
+
+In `ros2_control`, the `read()`/`write()` loop (Real-Time) and ROS service callbacks (Non-RT) run in different threads.
+To avoid data corruption or "jumps" during an update, the manager uses
+`std::optional<std::reference_wrapper<std::mutex>>` to safely lock your hardware communication mutex.
+
+### Integration in Hardware Interface
 
 ```cpp
-// Cast to AdjustableOffsetTransmission to access the method
-auto* adjustable_transmission = dynamic_cast<hector_transmission_interface::AdjustableOffsetTransmission*>(transmission.get());
-if (adjustable_transmission) {
-  adjustable_transmission->adjustTransmissionOffset(new_offset);
+#include "hector_transmission_interface/adjustable_offset_manager.hpp"
+
+// 1. Initialize with a reference to your Hardware Interface mutex
+// This ensures the service blocks the HW thread during the update.
+hardware_interface::CallbackReturn
+DynamixelHardwareInterface::on_configure(const rclcpp_lifecycle::State& previous_state){
+offset_manager_ = std::make_unique<AdjustableOffsetManager>(node_ptr, comm_mutex_);
+// You can additionally pass pre- and post-update callbacks if needed:
+// offset_manager_ = std::make_unique<AdjustableOffsetManager>(
+//     node_ptr, comm_mutex_, pre_update_callback, post_update_callback
+// ); // with signatures: std::function<bool()>
+...
 }
-```
 
-**Example: Implementing a Service to Adjust Offsets**
-
-The package provides the `AdjustTransmissionOffsets.srv` service definition, but you must implement the service server in your own code. Here's an example implementation:
-
-```cpp
-void adjustOffsetsCallback(
-  const hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Request::SharedPtr request,
-  hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Response::SharedPtr response)
+// 2. Register State Interfaces
+std::vector<hardware_interface::StateInterface::ConstSharedPtr> DynamixelHardwareInterface::on_export_state_interfaces()
 {
-  // Get current internal joint position from your robot state
-  double internal_joint_position = joint_state_interface->get_position();
-
-  // Get external measurement from service request
-  double external_joint_position = request->external_joint_measurements.position[joint_index];
-
-  // Access the transmission and calculate corrected offset
-  auto* adjustable_transmission = dynamic_cast<hector_transmission_interface::AdjustableOffsetTransmission*>(
-    transmission_manager->get(joint_name).get());
-
-  if (adjustable_transmission) {
-    double current_offset = adjustable_transmission->get_joint_offset();
-    double corrected_offset = external_joint_position - internal_joint_position + current_offset;
-
-    adjustable_transmission->adjustTransmissionOffset(corrected_offset);
-
-    response->adjusted_offsets.push_back(corrected_offset);
-    response->success = true;
-  } else {
-    response->success = false;
-    response->message = "Failed to cast transmission to AdjustableOffsetTransmission";
+  // create state interfaces
+  ...
+  // setup transmissions
+  ...
+  // register transmissions with offset manager
+  for (const auto& [name, joint] : joints_) {
+    // try to register only adjustable offset transmissions
+    offset_manager_->add_joint_state_interface(name, joint.state_transmission, [&joint]() {
+      return joint.joint_state.current.at(hardware_interface::HW_IF_POSITION);
+    });
   }
+  return state_interfaces;
 }
+
+// 3. Register Command Interfaces
+std::vector<hardware_interface::CommandInterface::SharedPtr> DynamixelHardwareInterface::on_export_command_interfaces()
+{
+  // create command interfaces
+  ...
+  /// setup transmissions
+  ...
+  /// register transmissions with offset manager
+  for (const auto& [name, joint] : joints_) {
+    // try to register only adjustable offset transmissions
+    offset_manager_->add_joint_command_interface(name, joint.command_transmission);
+  }
+  return command_interfaces;
+}
+
+// 4. make sure to block the hardware thread in your read()/write() methods
+void MyHardwareInterface::read() {
+
+  std::unique_lock<std::mutex> lock(dynamixel_comm_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    // Another operation is holding dynamixel_comm_mutex_; skipping write
+    return hardware_interface::return_type::OK;
+  }
+  ... normal read/write logic ...
+ }
 ```
 
-Once your service is implemented, you can call it with:
+---
+
+## 📡 Service Definition & Usage
+
+The manager exposes the following service:
+`~/adjust_transmission_offsets` [`hector_transmission_interface_msgs/srv/AdjustTransmissionOffsets`]
+
+### Request Fields
+
+* `external_joint_measurements`: The "Ground Truth" positions (e.g., from a camera).
+* `original_joint_state` (Optional): The internal positions recorded at the exact moment the external measurement was
+  taken. If omitted, the manager uses the live values from the `PositionGetter`.
+
+### Terminal Example
+
+If an external visual system detects that your `flipper_joint` is actually at `1.5708` rad (90°), but the robot thinks
+it is elsewhere:
 
 ```bash
-ros2 service call /adjust_transmission_offsets hector_transmission_interface_msgs/srv/AdjustTransmissionOffsets \
-  "{external_joint_measurements: {name: ['joint1', 'joint2'], position: [1.57, -0.785]}}"
+ros2 service call /my_robot/adjust_transmission_offsets \
+hector_transmission_interface_msgs/srv/AdjustTransmissionOffsets \
+"{
+  external_joint_measurements: {
+    name: ['flipper_joint'],
+    position: [1.5708]
+  }
+}"
+
 ```
 
-#### Method 2: Direct File Modification
-Offsets can be manually edited by modifying the text files in `~/.ros/dynamic_offset_transmissions/`. This requires restarting the controller manager to take effect and is not recommended for runtime adjustments.
+---
 
-### Important Safety Notes
+## ⚠️ Safety & Best Practices
 
-⚠️ **WARNING**: Always deactivate controllers claiming the affected joints before adjusting offsets! Changing offsets while controllers are active can cause unexpected behavior or damage.
+> **CONTROLLER CONFLICTS & DISCONTINUITIES**
+> Adjusting an offset changes the "Ground Truth" of a joint's position instantly. If a controller (like a PID-based
+> position controller) is active, it will perceive this change as a massive, instantaneous error (a "step change"), which
+> can trigger an aggressive and potentially damaging motor response.
 
-**Best Practice Workflow:**
-1. Stop all controllers using the affected joints
-2. Adjust the transmission offset(s)
-3. Restart the controllers
+### Recommended Calibration Workflow
 
-## Service Message Definition
+1. **Stop/Deactivate** active controllers for the joint.
+2. **Perform** the external ground-truth measurement.
+3. **Call** the adjustment service.
+4. **Restart/Activate** the controllers.
 
-The `AdjustTransmissionOffsets.srv` provides a standard interface for adjusting offsets:
+---
 
-**Request:**
-- `sensor_msgs/JointState external_joint_measurements` - External measurements of joint positions
+## 🛠 Troubleshooting
 
-**Response:**
-- `float64[] adjusted_offsets` - The new offset values that were set
-- `bool success` - Whether the operation succeeded
-- `string message` - Status message or error description
-
-**Note:** This library provides only the message definition. Service implementation is the responsibility of the library user and should be tailored to your specific hardware interface and calibration workflow.
+| Issue                  | Possible Cause     | Solution                                                                          |
+|------------------------|--------------------|-----------------------------------------------------------------------------------|
+| Offset not persisting  | Permissions        | Check `~/.ros/dynamic_offset_transmissions/` write access.                        |
+| Initial position wrong | Manual Move        | If the robot moved while OFF, the saved offset is invalid. Trigger a calibration. |
+| Motor "Jerk"           | Active Controllers | Ensure controllers are stopped/restarted during the service call.                 |
+| Service not found      | Executor           | Ensure the Node passed to the Manager is spinning in an executor.                 |
