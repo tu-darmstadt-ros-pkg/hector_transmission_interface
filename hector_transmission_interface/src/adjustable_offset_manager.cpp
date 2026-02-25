@@ -158,10 +158,10 @@ void AdjustableOffsetManager::handle_service(
     mj.state_handle->adjustOffset( corrected_offset );
     mj.command_handle->adjustOffset( corrected_offset );
 
-    response->adjusted_offsets.push_back( corrected_offset );
+    response->offset_changes.push_back( corrected_offset - current_offset );
   }
-  response->message = response->adjusted_offsets.empty() ? "No joints adjusted" : "Success";
-  response->success = !response->adjusted_offsets.empty();
+  response->message = response->offset_changes.empty() ? "No joints adjusted" : "Success";
+  response->success = !response->offset_changes.empty();
 
   // --- POST CALLBACK ---
   if ( post_callback_.has_value() ) {

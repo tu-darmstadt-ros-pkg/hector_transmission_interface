@@ -3,6 +3,6 @@ sensor_msgs/JointState external_joint_measurements
 # if not provided, the current joint states from the transmission interface will be used
 sensor_msgs/JointState original_joint_state
 ---
-float64[] adjusted_offsets
+float64[] offset_changes
 bool success
 string message

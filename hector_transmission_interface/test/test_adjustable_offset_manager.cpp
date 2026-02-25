@@ -62,10 +62,12 @@ TEST_F( AdjustableOffsetManagerTest, RobustOffsetCalculation )
   std::string joint_name = "flipper_joint";
 
   // Logic: NewOffset = External(1.2) - Internal(1.0) + CurrentOffset(0.5) = 0.7
+  //        OffsetChange = NewOffset(0.7) - CurrentOffset(0.5) = 0.2
   double current_internal_val = 1.0;
   double old_offset = 0.5;
   double external_meas = 1.2;
   double expected_new_offset = 0.7;
+  double expected_offset_change = expected_new_offset - old_offset; // 0.2
 
   // Setup Mock expectations for the internal transmission handles
   EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( old_offset ) );
@@ -96,17 +98,17 @@ TEST_F( AdjustableOffsetManagerTest, RobustOffsetCalculation )
   // 3. Set up Expected Response for validation
   AdjustTransmissionOffsets::Response expected_response;
   expected_response.success = true;
-  expected_response.adjusted_offsets.push_back( expected_new_offset );
+  expected_response.offset_changes.push_back( expected_offset_change );
   // Optional: match message content if desired
 
   // 4. Expect that the service will call send_response with the correct data
   // Using ElementsAre to check the floating point vector content
-  EXPECT_CALL(
-      *service,
-      send_response( *request_header,
-                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, true ),
-                                     Field( &AdjustTransmissionOffsets::Response::adjusted_offsets,
-                                            ElementsAre( DoubleEq( expected_new_offset ) ) ) ) ) );
+  EXPECT_CALL( *service,
+               send_response(
+                   *request_header,
+                   testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, true ),
+                                   Field( &AdjustTransmissionOffsets::Response::offset_changes,
+                                          ElementsAre( DoubleEq( expected_offset_change ) ) ) ) ) );
 
   // 5. Simulate the service call
   service->handle_request( request_header, request );
@@ -330,10 +332,12 @@ TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
   std::string joint_name = "flipper_joint";
 
   // Logic: NewOffset = External(1.2) - Internal(1.0) + CurrentOffset(0.5) = 0.7
+  //        OffsetChange = NewOffset(0.7) - CurrentOffset(0.5) = 0.2
   double current_internal_val = 1.0;
   double old_offset = 0.5;
   double external_meas = 1.2;
   double expected_new_offset = 0.7;
+  double expected_offset_change = expected_new_offset - old_offset; // 0.2
 
   // Setup Mock expectations for the internal transmission handles
   EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( old_offset ) );
@@ -364,17 +368,17 @@ TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
   // 3. Set up Expected Response for validation
   AdjustTransmissionOffsets::Response expected_response;
   expected_response.success = true;
-  expected_response.adjusted_offsets.push_back( expected_new_offset );
+  expected_response.offset_changes.push_back( expected_offset_change );
   // Optional: match message content if desired
 
   // 4. Expect that the service will call send_response with the correct data
   // Using ElementsAre to check the floating point vector content
-  EXPECT_CALL(
-      *service,
-      send_response( *request_header,
-                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, true ),
-                                     Field( &AdjustTransmissionOffsets::Response::adjusted_offsets,
-                                            ElementsAre( DoubleEq( expected_new_offset ) ) ) ) ) );
+  EXPECT_CALL( *service,
+               send_response(
+                   *request_header,
+                   testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, true ),
+                                   Field( &AdjustTransmissionOffsets::Response::offset_changes,
+                                          ElementsAre( DoubleEq( expected_offset_change ) ) ) ) ) );
 
   // 5. Simulate the service call
   service->handle_request( request_header, request );

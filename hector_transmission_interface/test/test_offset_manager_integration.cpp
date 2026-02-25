@@ -82,7 +82,7 @@ TEST_F( OffsetManagerIntegrationTest, UpdateOffsetAndVerify )
 
   ASSERT_NE( response, nullptr );
   ASSERT_TRUE( response->success ) << response->message;
-  EXPECT_NEAR( response->adjusted_offsets[0], 1.5, 1e-4 );
+  EXPECT_NEAR( response->offset_changes[0], 1.5, 1e-4 );
 
   // Verify Internal State Updated
   hardware_->propagate_read();
@@ -135,13 +135,14 @@ TEST_F( OffsetManagerIntegrationTest, PersistenceAcrossRestarts )
   // Internal (from HW) is 4.14.
   // Existing offset = 3.14.
   // New Offset = Target(5.14) - Internal(4.14) + Existing(3.14) = 4.14.
+  // Offset Change = New(4.14) - Existing(3.14) = 1.0
   request->external_joint_measurements.position.push_back( 5.14 );
 
   auto response = hector_testing_utils::call_service<AdjustTransmissionOffsets>(
       fresh_client->get(), request, *executor_ );
 
   ASSERT_TRUE( response->success );
-  EXPECT_NEAR( response->adjusted_offsets[0], 4.14, 1e-4 );
+  EXPECT_NEAR( response->offset_changes[0], 1.0, 1e-4 );
 }
 
 TEST_F( OffsetManagerIntegrationTest, MultipleJoints )
@@ -170,9 +171,9 @@ TEST_F( OffsetManagerIntegrationTest, MultipleJoints )
       client_->get(), request, *executor_ );
 
   ASSERT_TRUE( response->success );
-  ASSERT_EQ( response->adjusted_offsets.size(), 2u );
-  EXPECT_NEAR( response->adjusted_offsets[0], 0.5, 1e-4 );
-  EXPECT_NEAR( response->adjusted_offsets[1], 1.0, 1e-4 );
+  ASSERT_EQ( response->offset_changes.size(), 2u );
+  EXPECT_NEAR( response->offset_changes[0], 0.5, 1e-4 );
+  EXPECT_NEAR( response->offset_changes[1], 1.0, 1e-4 );
 
   hardware_->propagate_read();
   EXPECT_NEAR( hardware_->get_joint_position( j1 ), 1.5, 1e-6 );
@@ -193,7 +194,7 @@ TEST_F( OffsetManagerIntegrationTest, UnknownJointName )
   // Service should return false for success if no joints were adjusted
   ASSERT_TRUE( response );
   EXPECT_FALSE( response->success );
-  EXPECT_TRUE( response->adjusted_offsets.empty() );
+  EXPECT_TRUE( response->offset_changes.empty() );
 }
 
 TEST_F( OffsetManagerIntegrationTest, NaNInputRobustness )
@@ -213,7 +214,7 @@ TEST_F( OffsetManagerIntegrationTest, NaNInputRobustness )
 
   ASSERT_TRUE( response );
   EXPECT_FALSE( response->success ); // Nothing adjusted
-  EXPECT_TRUE( response->adjusted_offsets.empty() );
+  EXPECT_TRUE( response->offset_changes.empty() );
 
   // Ensure position didn't change (garbage not applied)
   hardware_->propagate_read();
@@ -237,7 +238,7 @@ TEST_F( OffsetManagerIntegrationTest, OffsetAccumulation )
     auto resp = hector_testing_utils::call_service<AdjustTransmissionOffsets>( client_->get(), req,
                                                                                *executor_ );
     ASSERT_TRUE( resp->success );
-    EXPECT_NEAR( resp->adjusted_offsets[0], 0.5, 1e-4 );
+    EXPECT_NEAR( resp->offset_changes[0], 0.5, 1e-4 );
   }
 
   hardware_->propagate_read();
@@ -252,7 +253,8 @@ TEST_F( OffsetManagerIntegrationTest, OffsetAccumulation )
                                                                                *executor_ );
     ASSERT_TRUE( resp->success );
     // New Offset = Target(1.6) - Internal(1.5) + Existing(0.5) = 0.6
-    EXPECT_NEAR( resp->adjusted_offsets[0], 0.6, 1e-4 );
+    // Offset Change = New(0.6) - Existing(0.5) = 0.1
+    EXPECT_NEAR( resp->offset_changes[0], 0.1, 1e-4 );
   }
 
   hardware_->propagate_read(); // Raw(1.0) + Offset(0.6) = 1.6
