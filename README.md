@@ -135,6 +135,34 @@ hector_transmission_interface_msgs/srv/AdjustTransmissionOffsets \
 
 ---
 
+## 🔄 Automatic 2π Actuator Jump Correction
+
+Dynamixel actuators can briefly lose power (e.g., due to voltage dips or connector issues) and lose their absolute
+rotation tracking. When power returns, the actuator's internal position resets by a multiple of 2π. For joints **with a
+transmission** (reduction ≠ 1), this causes the joint position to jump by `2π / reduction`, which is observable and
+incorrect.
+
+### How It Works
+
+The `AdjustableOffsetTransmission` overrides `actuator_to_joint()` to automatically detect and correct these jumps:
+
+1. On each read cycle, the actuator position delta from the previous cycle is checked.
+2. If the delta is close to a multiple of 2π (within a configurable tolerance of 0.2π), a power-glitch jump is assumed.
+3. The joint offset is adjusted by `-n × 2π / reduction` to cancel out the jump.
+4. The corrected offset is persisted to disk.
+5. A warning is logged for diagnostics.
+
+### Command Transmission Synchronization
+
+The `AdjustableOffsetManager` provides a `syncCommandOffsets()` method that should be called after
+`actuator_to_joint()` in the read loop. It iterates all managed joints and, if the state transmission's offset
+differs from the command transmission's offset (i.e., an automatic correction occurred), it synchronizes the
+command transmission to match. This keeps goal positions consistent without requiring the hardware interface
+to know about the correction mechanism.
+
+
+---
+
 ## ⚠️ Safety & Best Practices
 
 > **CONTROLLER CONFLICTS & DISCONTINUITIES**
