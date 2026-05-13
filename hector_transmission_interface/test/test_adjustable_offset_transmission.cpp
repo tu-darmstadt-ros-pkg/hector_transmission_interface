@@ -293,3 +293,165 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_WithReduction1_JointJump
   EXPECT_EQ( trans.getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
 }
+
+// ============================================================================
+// Passthrough behavior (pass_through_effort + pass_through_interfaces)
+// ============================================================================
+
+TEST_F( AdjustableOffsetTransmissionTest, DefaultEffortStillScalesByReduction )
+{
+  // Regression guard: with pass_through_effort=false (the default), effort is
+  // scaled by reduction in actuator_to_joint, matching SimpleTransmission semantics.
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  double actuator_eff = 0.0, joint_eff = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, 2.0, 0.0 );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, hardware_interface::HW_IF_EFFORT, &joint_eff } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", hardware_interface::HW_IF_EFFORT, &actuator_eff } };
+  trans.configure( jh, ah );
+
+  actuator_eff = 1.5;
+  trans.actuator_to_joint();
+  EXPECT_NEAR( joint_eff, 1.5 * 2.0, 1e-9 ); // base SimpleTransmission: tau_j = n * tau_a
+
+  joint_eff = 4.0;
+  trans.joint_to_actuator();
+  EXPECT_NEAR( actuator_eff, 4.0 / 2.0, 1e-9 ); // tau_a = tau_j / n
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_ActuatorToJointIsIdentity )
+{
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  double actuator_eff = 0.0, joint_eff = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, 2.0, 0.0,
+                                      /*pass_through_effort=*/true );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, hardware_interface::HW_IF_EFFORT, &joint_eff } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", hardware_interface::HW_IF_EFFORT, &actuator_eff } };
+  trans.configure( jh, ah );
+
+  actuator_eff = 1.5;
+  trans.actuator_to_joint();
+  EXPECT_NEAR( joint_eff, 1.5, 1e-9 ); // identity, NOT scaled
+
+  // Position still scales normally
+  actuator_pos = 4.0;
+  trans.actuator_to_joint();
+  EXPECT_NEAR( joint_pos, 4.0 / 2.0, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_JointToActuatorIsIdentity )
+{
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  double actuator_eff = 0.0, joint_eff = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, 2.0, 0.0,
+                                      /*pass_through_effort=*/true );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, hardware_interface::HW_IF_EFFORT, &joint_eff } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", hardware_interface::HW_IF_EFFORT, &actuator_eff } };
+  trans.configure( jh, ah );
+
+  joint_eff = 4.0;
+  trans.joint_to_actuator();
+  EXPECT_NEAR( actuator_eff, 4.0, 1e-9 ); // identity, NOT divided
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PassThroughCustomInterface_BothDirections )
+{
+  // A non-standard interface name like "current" should bridge as identity
+  // when listed in pass_through_interfaces, even though SimpleTransmission
+  // does not know about it (and would otherwise drop it entirely).
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  double actuator_cur = 0.0, joint_cur = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, -10.5, 0.0,
+                                      /*pass_through_effort=*/false,
+                                      /*pass_through_interfaces=*/{ "current" } );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, "current", &joint_cur } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", "current", &actuator_cur } };
+  trans.configure( jh, ah );
+
+  // joint -> actuator: command flows out
+  joint_cur = 2.5;
+  trans.joint_to_actuator();
+  EXPECT_NEAR( actuator_cur, 2.5, 1e-9 );
+
+  // actuator -> joint: state flows in
+  actuator_cur = 7.0;
+  trans.actuator_to_joint();
+  EXPECT_NEAR( joint_cur, 7.0, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffortAndCustom_PositionStillScaled )
+{
+  // Combined: gripper-like config — position scales, effort+current passthrough.
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  double actuator_eff = 0.0, joint_eff = 0.0;
+  double actuator_cur = 0.0, joint_cur = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, -10.5, 0.5,
+                                      /*pass_through_effort=*/true,
+                                      /*pass_through_interfaces=*/{ "current" } );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, hardware_interface::HW_IF_EFFORT, &joint_eff },
+      { joint_name, "current", &joint_cur } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", hardware_interface::HW_IF_EFFORT, &actuator_eff },
+      { "actuator", "current", &actuator_cur } };
+  trans.configure( jh, ah );
+
+  actuator_pos = 3.0;
+  actuator_eff = 1.2;
+  actuator_cur = 0.8;
+  trans.actuator_to_joint();
+  EXPECT_NEAR( joint_pos, 3.0 / -10.5 + 0.5, 1e-9 ); // scaled with offset
+  EXPECT_NEAR( joint_eff, 1.2, 1e-9 );               // identity
+  EXPECT_NEAR( joint_cur, 0.8, 1e-9 );               // identity
+
+  joint_pos = 0.5;
+  joint_eff = 2.0;
+  joint_cur = 1.5;
+  trans.joint_to_actuator();
+  EXPECT_NEAR( actuator_pos, ( 0.5 - 0.5 ) * -10.5, 1e-9 ); // (joint - offset) * reduction
+  EXPECT_NEAR( actuator_eff, 2.0, 1e-9 );                   // identity
+  EXPECT_NEAR( actuator_cur, 1.5, 1e-9 );                   // identity
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_JumpCorrectionStillWorks )
+{
+  // The 2pi jump correction must still trigger on actuator position even when
+  // effort is configured as passthrough.
+  double actuator_pos = 1.0, joint_pos = 0.0;
+  double actuator_eff = 0.0, joint_eff = 0.0;
+  AdjustableOffsetTransmission trans( joint_name, 2.0, 0.0,
+                                      /*pass_through_effort=*/true );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos },
+      { joint_name, hardware_interface::HW_IF_EFFORT, &joint_eff } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos },
+      { "actuator", hardware_interface::HW_IF_EFFORT, &actuator_eff } };
+  trans.configure( jh, ah );
+
+  trans.actuator_to_joint(); // baseline
+  const double joint_pos_before = joint_pos;
+
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  EXPECT_EQ( trans.getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
