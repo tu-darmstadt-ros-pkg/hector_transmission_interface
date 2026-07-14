@@ -72,10 +72,16 @@ std::shared_ptr<transmission_interface::Transmission> AdjustableOffsetTransmissi
       pass_through_interfaces = parseInterfaceList( pti_it->second );
     }
 
+    double jump_detection_max_gap_seconds = 0.5;
+    const auto gap_it = transmission_info.parameters.find( "jump_detection_max_gap_seconds" );
+    if ( gap_it != transmission_info.parameters.end() ) {
+      jump_detection_max_gap_seconds = std::stod( gap_it->second );
+    }
+
     std::shared_ptr<transmission_interface::Transmission> transmission(
         new AdjustableOffsetTransmission( joint_name, mechanical_reduction, offset,
-                                          pass_through_effort,
-                                          std::move( pass_through_interfaces ) ) );
+                                          pass_through_effort, std::move( pass_through_interfaces ),
+                                          jump_detection_max_gap_seconds ) );
     return transmission;
   } catch ( const std::exception &ex ) {
     RCLCPP_ERROR( rclcpp::get_logger( "simple_transmission_loader" ),
