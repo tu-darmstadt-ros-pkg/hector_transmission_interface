@@ -25,11 +25,20 @@ class AdjustableOffsetTransmission : public transmission_interface::SimpleTransm
 public:
   using OffsetCorrectionCallback = std::function<void( double new_offset )>;
 
-  explicit AdjustableOffsetTransmission( const std::string &joint_name,
-                                         double joint_to_actuator_reduction,
-                                         double joint_offset = 0.0, bool pass_through_effort = false,
-                                         std::vector<std::string> pass_through_interfaces = {},
-                                         double jump_detection_max_gap_seconds = 0.5 );
+  /**
+   * \brief Default maximum age of the previous measurement for 2pi jump detection.
+   *
+   * Since the hardware interface only calls actuator_to_joint() after a successful read,
+   * two successive measurements are normally one control cycle apart, so this is a generous
+   * upper bound rather than a tight one. Tune it down towards a few control periods via the
+   * jump_detection_max_gap_seconds URDF parameter if the joint can be back-driven quickly.
+   */
+  static constexpr double DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS = 0.5;
+
+  explicit AdjustableOffsetTransmission(
+      const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset = 0.0,
+      bool pass_through_effort = false, std::vector<std::string> pass_through_interfaces = {},
+      double jump_detection_max_gap_seconds = DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS );
   /***
    * \brief
    * Adjusts the transmission offset for the joint.
@@ -132,6 +141,15 @@ inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
       pass_through_effort_( pass_through_effort ),
       pass_through_interface_names_( std::move( pass_through_interfaces ) )
 {
+  // A negative or NaN threshold would compare false against every gap and silently disable
+  // correction forever; 0.0 is preserved: it legitimately means "never auto-correct".
+  if ( jump_detection_max_gap_seconds_ < 0.0 || std::isnan( jump_detection_max_gap_seconds_ ) ) {
+    RCLCPP_WARN(
+        rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+        "Invalid jump_detection_max_gap_seconds (%f) for joint '%s'; using default %.2f s.",
+        jump_detection_max_gap_seconds, joint_name_.c_str(), DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS );
+    jump_detection_max_gap_seconds_ = DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS;
+  }
   // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
   transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );

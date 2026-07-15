@@ -27,6 +27,19 @@ bool parseBoolParam( const std::string &value )
   return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
 }
 
+double parseDoubleParam( const std::string &value, double default_value,
+                         const std::string &param_name, const std::string &joint_name )
+{
+  try {
+    return std::stod( value );
+  } catch ( const std::exception &ex ) {
+    RCLCPP_WARN( rclcpp::get_logger( "simple_transmission_loader" ),
+                 "Invalid %s '%s' for joint '%s' (%s); using default %.2f.", param_name.c_str(),
+                 value.c_str(), joint_name.c_str(), ex.what(), default_value );
+    return default_value;
+  }
+}
+
 std::vector<std::string> parseInterfaceList( const std::string &value )
 {
   // Split on commas or whitespace; trim each entry; drop empties.
@@ -72,10 +85,13 @@ std::shared_ptr<transmission_interface::Transmission> AdjustableOffsetTransmissi
       pass_through_interfaces = parseInterfaceList( pti_it->second );
     }
 
-    double jump_detection_max_gap_seconds = 0.5;
+    double jump_detection_max_gap_seconds =
+        AdjustableOffsetTransmission::DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS;
     const auto gap_it = transmission_info.parameters.find( "jump_detection_max_gap_seconds" );
     if ( gap_it != transmission_info.parameters.end() ) {
-      jump_detection_max_gap_seconds = std::stod( gap_it->second );
+      jump_detection_max_gap_seconds =
+          parseDoubleParam( gap_it->second, jump_detection_max_gap_seconds,
+                            "jump_detection_max_gap_seconds", joint_name );
     }
 
     std::shared_ptr<transmission_interface::Transmission> transmission(
