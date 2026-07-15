@@ -1,11 +1,14 @@
 //
 // Created by aljoscha-schmidt on 7/12/25.
 //
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <hector_transmission_interface/adjustable_offset_transmission.hpp>
+#include <limits>
+#include <thread>
 
 using namespace hector_transmission_interface;
 
@@ -52,12 +55,13 @@ protected:
    * Sets up actuator and joint position handles so that actuator_to_joint() can operate.
    * The caller owns the actuator_pos and joint_pos doubles and must keep them alive.
    */
-  static AdjustableOffsetTransmission createConfiguredTransmission( const std::string &name,
-                                                                    double reduction, double offset,
-                                                                    double &actuator_pos,
-                                                                    double &joint_pos )
+  static AdjustableOffsetTransmission
+  createConfiguredTransmission( const std::string &name, double reduction, double offset,
+                                double &actuator_pos, double &joint_pos,
+                                double jump_detection_max_gap_seconds = 0.5 )
   {
-    AdjustableOffsetTransmission trans( name, reduction, offset );
+    AdjustableOffsetTransmission trans( name, reduction, offset, false, {},
+                                        jump_detection_max_gap_seconds );
 
     std::vector<transmission_interface::JointHandle> joint_handles;
     joint_handles.emplace_back( name, hardware_interface::HW_IF_POSITION, &joint_pos );
@@ -292,6 +296,145 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_WithReduction1_JointJump
 
   EXPECT_EQ( trans.getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+// ============================================================================
+// Measurement-gap gating (e-stop safety)
+// ============================================================================
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_SuppressedAfterMeasurementGap )
+{
+  // Scenario: e-stop cuts actuator power, the hardware interface stops calling
+  // actuator_to_joint (no valid reads), and the flipper is moved manually by ~pi
+  // (= ~2pi on the actuator side with reduction 2). After power returns, this must
+  // NOT be treated as an absolute-position reset.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  const double initial_offset = 0.25;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, initial_offset, actuator_pos,
+                                             joint_pos, /*jump_detection_max_gap_seconds=*/0.05 );
+
+  trans.actuator_to_joint(); // baseline
+
+  // Simulate the read gap (e-stop period)
+  std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+
+  // Manual movement that looks like a +2pi actuator jump
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  // No correction: position is taken at face value, offset untouched
+  EXPECT_EQ( trans.getCorrectionCount(), 0 );
+  EXPECT_NEAR( trans.get_joint_offset(), initial_offset, 1e-9 );
+  EXPECT_NEAR( joint_pos, ( 1.0 + 2.0 * M_PI ) / 2.0 + initial_offset, 1e-9 );
+  // Offset file must not have been rewritten either
+  EXPECT_TRUE( fileContainsValue( initial_offset ) );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_ResumesAfterMeasurementGap )
+{
+  // After a suppressed gap, the baseline is re-seeded and a subsequent genuine
+  // 2pi reset (between temporally adjacent reads) must still be corrected.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos,
+                                             /*jump_detection_max_gap_seconds=*/0.05 );
+
+  trans.actuator_to_joint(); // baseline
+
+  std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+  actuator_pos = 2.0; // moved during gap (not 2pi-like, just re-seeds)
+  trans.actuator_to_joint();
+  EXPECT_EQ( trans.getCorrectionCount(), 0 );
+  const double joint_pos_before = joint_pos;
+
+  // Genuine power-glitch reset right after: consecutive reads, delta = -2pi
+  actuator_pos = 2.0 - 2.0 * M_PI;
+  trans.actuator_to_joint();
+  EXPECT_EQ( trans.getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_QuickJumpWithinGapStillCorrected )
+{
+  // A jump between two reads well within the allowed gap is corrected as before.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos,
+                                             /*jump_detection_max_gap_seconds=*/0.5 );
+
+  trans.actuator_to_joint(); // baseline
+  const double joint_pos_before = joint_pos;
+
+  std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  EXPECT_EQ( trans.getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+// ============================================================================
+// jump_detection_max_gap_seconds validation
+// ============================================================================
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_NegativeGapFallsBackToDefault )
+{
+  // A negative threshold would compare false against every gap and silently disable
+  // correction forever. It must fall back to the default and still correct.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos,
+                                             /*jump_detection_max_gap_seconds=*/-1.0 );
+
+  trans.actuator_to_joint(); // baseline
+  const double joint_pos_before = joint_pos;
+
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  EXPECT_EQ( trans.getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_NanGapFallsBackToDefault )
+{
+  // NaN compares false against every gap, which would disable correction just as silently.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission(
+      joint_name, 2.0, 0.0, actuator_pos, joint_pos,
+      /*jump_detection_max_gap_seconds=*/std::numeric_limits<double>::quiet_NaN() );
+
+  trans.actuator_to_joint(); // baseline
+  const double joint_pos_before = joint_pos;
+
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  EXPECT_EQ( trans.getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_ZeroGapDisablesCorrection )
+{
+  // 0.0 is a legitimate setting meaning "never auto-correct": it must be preserved
+  // rather than normalized to the default.
+  double actuator_pos = 1.0;
+  double joint_pos = 0.0;
+  const double initial_offset = 0.25;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, initial_offset, actuator_pos,
+                                             joint_pos, /*jump_detection_max_gap_seconds=*/0.0 );
+
+  trans.actuator_to_joint(); // baseline
+
+  // Even an immediately adjacent 2pi jump must be taken at face value.
+  actuator_pos = 1.0 + 2.0 * M_PI;
+  trans.actuator_to_joint();
+
+  EXPECT_EQ( trans.getCorrectionCount(), 0 );
+  EXPECT_NEAR( trans.get_joint_offset(), initial_offset, 1e-9 );
+  EXPECT_NEAR( joint_pos, ( 1.0 + 2.0 * M_PI ) / 2.0 + initial_offset, 1e-9 );
 }
 
 // ============================================================================

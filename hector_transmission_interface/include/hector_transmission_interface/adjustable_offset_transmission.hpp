@@ -6,6 +6,7 @@
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -24,10 +25,20 @@ class AdjustableOffsetTransmission : public transmission_interface::SimpleTransm
 public:
   using OffsetCorrectionCallback = std::function<void( double new_offset )>;
 
-  explicit AdjustableOffsetTransmission( const std::string &joint_name,
-                                         double joint_to_actuator_reduction,
-                                         double joint_offset = 0.0, bool pass_through_effort = false,
-                                         std::vector<std::string> pass_through_interfaces = {} );
+  /**
+   * \brief Default maximum age of the previous measurement for 2pi jump detection.
+   *
+   * Since the hardware interface only calls actuator_to_joint() after a successful read,
+   * two successive measurements are normally one control cycle apart, so this is a generous
+   * upper bound rather than a tight one. Tune it down towards a few control periods via the
+   * jump_detection_max_gap_seconds URDF parameter if the joint can be back-driven quickly.
+   */
+  static constexpr double DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS = 0.5;
+
+  explicit AdjustableOffsetTransmission(
+      const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset = 0.0,
+      bool pass_through_effort = false, std::vector<std::string> pass_through_interfaces = {},
+      double jump_detection_max_gap_seconds = DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS );
   /***
    * \brief
    * Adjusts the transmission offset for the joint.
@@ -57,6 +68,15 @@ public:
    * and reset by a multiple of 2pi. On the joint side (with a transmission ratio),
    * this manifests as a jump of 2pi/reduction. This method detects such jumps
    * and compensates by adjusting the joint offset.
+   *
+   * Jump detection only runs if the previous call is younger than
+   * jump_detection_max_gap_seconds. Otherwise, the jump is ambiguous:
+   * it may be a genuine absolute-position reset,
+   * but it may just as well be manual movement while the actuator was powered off (e.g. during an e-stop).
+   *
+   * IMPORTANT: the hardware interface must only call this method after a SUCCESSFUL
+   * actuator read. Calling it with stale (frozen) actuator values during a
+   * communication outage defeats the gap detection.
    *
    * Also identity-copies any passthrough interfaces from actuator to joint side.
    */
@@ -94,6 +114,8 @@ private:
 
   // 2pi jump detection state
   std::optional<double> prev_actuator_position_;
+  std::chrono::steady_clock::time_point prev_measurement_time_;
+  double jump_detection_max_gap_seconds_;
   int correction_count_{ 0 };
   OffsetCorrectionCallback offset_correction_callback_;
 
@@ -112,11 +134,22 @@ private:
 
 inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
     const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset,
-    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
+    bool pass_through_effort, std::vector<std::string> pass_through_interfaces,
+    double jump_detection_max_gap_seconds )
     : SimpleTransmission( joint_to_actuator_reduction, joint_offset ), joint_name_( joint_name ),
+      jump_detection_max_gap_seconds_( jump_detection_max_gap_seconds ),
       pass_through_effort_( pass_through_effort ),
       pass_through_interface_names_( std::move( pass_through_interfaces ) )
 {
+  // A negative or NaN threshold would compare false against every gap and silently disable
+  // correction forever; 0.0 is preserved: it legitimately means "never auto-correct".
+  if ( jump_detection_max_gap_seconds_ < 0.0 || std::isnan( jump_detection_max_gap_seconds_ ) ) {
+    RCLCPP_WARN(
+        rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+        "Invalid jump_detection_max_gap_seconds (%f) for joint '%s'; using default %.2f s.",
+        jump_detection_max_gap_seconds, joint_name_.c_str(), DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS );
+    jump_detection_max_gap_seconds_ = DEFAULT_JUMP_DETECTION_MAX_GAP_SECONDS;
+  }
   // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
   transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
@@ -187,10 +220,14 @@ inline void AdjustableOffsetTransmission::saveTransmissionOffset() const
 
 inline void AdjustableOffsetTransmission::actuator_to_joint()
 {
+  const auto now = std::chrono::steady_clock::now();
+
   // Read the current actuator position before the base transform
   if ( actuator_position_ && prev_actuator_position_.has_value() ) {
     double current_actuator_pos = actuator_position_.get_value();
     double delta = current_actuator_pos - prev_actuator_position_.value();
+    double measurement_gap_seconds =
+        std::chrono::duration<double>( now - prev_measurement_time_ ).count();
 
     // Check if the jump is close to a multiple of 2pi
     // Round to nearest integer multiple of 2pi
@@ -198,20 +235,36 @@ inline void AdjustableOffsetTransmission::actuator_to_joint()
     int n_jumps = static_cast<int>( std::round( n_jumps_raw ) );
 
     if ( n_jumps != 0 && std::abs( delta - n_jumps * TWO_PI ) < JUMP_TOLERANCE ) {
-      // Detected a 2pi jump on the actuator side.
-      // Compensate in the joint offset: the jump in joint space is n_jumps * 2pi / reduction
-      double joint_space_correction = n_jumps * TWO_PI / reduction_;
-      jnt_offset_ -= joint_space_correction;
-      correction_count_ += std::abs( n_jumps );
-      saveTransmissionOffset();
+      if ( measurement_gap_seconds > jump_detection_max_gap_seconds_ ) {
+        // A ~n*2pi delta across a measurement gap is ambiguous: it may be a genuine
+        // absolute-position reset, but it may just as well be manual movement while the
+        // actuator was powered off (e.g. during an e-stop). Correcting here could shift
+        // the reported joint position and cause dangerous motion, so only re-seed the
+        // baseline and warn.
+        RCLCPP_WARN(
+            rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+            "Actuator position of joint '%s' changed by ~%d x 2pi (delta: %.4f rad) across a "
+            "measurement gap of %.2f s (max %.2f s). NOT auto-correcting: the joint may have "
+            "been moved while unpowered. If the actuator lost its absolute position, "
+            "re-reference the joint via the offset adjustment service.",
+            joint_name_.c_str(), n_jumps, delta, measurement_gap_seconds,
+            jump_detection_max_gap_seconds_ );
+      } else {
+        // Detected a 2pi jump on the actuator side.
+        // Compensate in the joint offset: the jump in joint space is n_jumps * 2pi / reduction
+        double joint_space_correction = n_jumps * TWO_PI / reduction_;
+        jnt_offset_ -= joint_space_correction;
+        correction_count_ += std::abs( n_jumps );
+        saveTransmissionOffset();
 
-      RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                   "Detected %d x 2pi actuator position jump on joint '%s' "
-                   "(actuator delta: %.4f rad). Corrected offset to %.6f.",
-                   n_jumps, joint_name_.c_str(), delta, jnt_offset_ );
+        RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                     "Detected %d x 2pi actuator position jump on joint '%s' "
+                     "(actuator delta: %.4f rad). Corrected offset to %.6f.",
+                     n_jumps, joint_name_.c_str(), delta, jnt_offset_ );
 
-      if ( offset_correction_callback_ ) {
-        offset_correction_callback_( jnt_offset_ );
+        if ( offset_correction_callback_ ) {
+          offset_correction_callback_( jnt_offset_ );
+        }
       }
     }
   }
@@ -229,6 +282,7 @@ inline void AdjustableOffsetTransmission::actuator_to_joint()
   // Track actuator position for next cycle's jump detection
   if ( actuator_position_ ) {
     prev_actuator_position_ = actuator_position_.get_value();
+    prev_measurement_time_ = now;
   }
 }
 
@@ -319,6 +373,7 @@ inline void AdjustableOffsetTransmission::adjustTransmissionOffset( double offse
   // Reset jump detection to avoid false positive after manual offset change
   if ( actuator_position_ ) {
     prev_actuator_position_ = actuator_position_.get_value();
+    prev_measurement_time_ = std::chrono::steady_clock::now();
   }
 }
 } // namespace hector_transmission_interface
