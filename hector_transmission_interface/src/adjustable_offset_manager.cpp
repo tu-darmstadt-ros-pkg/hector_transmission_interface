@@ -25,8 +25,8 @@ private:
 AdjustableOffsetManager::AdjustableOffsetManager(
     rclcpp::Node::SharedPtr node, std::optional<std::reference_wrapper<std::mutex>> comm_mutex,
     std::optional<ServiceCallback> pre_callback, std::optional<ServiceCallback> post_callback )
-    : node_( node ), comm_mutex_( comm_mutex ), pre_callback_( pre_callback ),
-      post_callback_( post_callback )
+    : node_( node ), comm_mutex_( comm_mutex ), pre_callback_unlocked_( pre_callback ),
+      post_callback_locked_( post_callback )
 {
   service_ = node_->create_service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>(
       "~/adjust_transmission_offsets", std::bind( &AdjustableOffsetManager::handle_service, this,
@@ -116,8 +116,8 @@ void AdjustableOffsetManager::handle_service(
         response )
 {
   // --- PRE CALLBACK ---
-  if ( pre_callback_.has_value() ) {
-    if ( !pre_callback_.value()() ) {
+  if ( pre_callback_unlocked_.has_value() ) {
+    if ( !pre_callback_unlocked_.value()() ) {
       RCLCPP_WARN( node_->get_logger(), "Pre-callback returned false, aborting service call." );
       response->success = false;
       response->message = "Pre-callback failed";
@@ -126,11 +126,8 @@ void AdjustableOffsetManager::handle_service(
   }
 
   // --- THREAD SAFETY ---
-  std::unique_lock<std::mutex> lock;
-  if ( comm_mutex_.has_value() ) {
-    lock = std::unique_lock<std::mutex>( comm_mutex_->get() );
-    RCLCPP_DEBUG( node_->get_logger(), "Offset adjustment service locked hardware mutex." );
-  }
+  // Held for the rest of this function, including the post-callback and every position_getter call.
+  const OptionalCommLock lock( comm_mutex_ );
 
   response->success = false;
 
@@ -199,8 +196,8 @@ void AdjustableOffsetManager::handle_service(
   response->success = !response->offset_changes.empty();
 
   // --- POST CALLBACK ---
-  if ( post_callback_.has_value() ) {
-    if ( !post_callback_.value()() ) {
+  if ( post_callback_locked_.has_value() ) {
+    if ( !post_callback_locked_.value()() ) {
       RCLCPP_WARN( node_->get_logger(), "Post-callback returned false." );
     }
   }
@@ -210,8 +207,8 @@ void AdjustableOffsetManager::handle_flip_by_pi(
     const std::shared_ptr<hector_transmission_interface_msgs::srv::FlipByPi::Response> response )
 {
   // --- PRE CALLBACK ---
-  if ( pre_callback_.has_value() ) {
-    if ( !pre_callback_.value()() ) {
+  if ( pre_callback_unlocked_.has_value() ) {
+    if ( !pre_callback_unlocked_.value()() ) {
       RCLCPP_WARN( node_->get_logger(),
                    "Pre-callback returned false, aborting flip_by_pi service call." );
       response->success = false;
@@ -221,11 +218,8 @@ void AdjustableOffsetManager::handle_flip_by_pi(
   }
 
   // --- THREAD SAFETY ---
-  std::unique_lock<std::mutex> lock;
-  if ( comm_mutex_.has_value() ) {
-    lock = std::unique_lock<std::mutex>( comm_mutex_->get() );
-    RCLCPP_DEBUG( node_->get_logger(), "flip_by_pi service locked hardware mutex." );
-  }
+  // Held for the rest of this function, including the post-callback.
+  const OptionalCommLock lock( comm_mutex_ );
 
   size_t flipped_count = 0;
 
@@ -262,8 +256,8 @@ void AdjustableOffsetManager::handle_flip_by_pi(
                           : "No joints flipped";
 
   // --- POST CALLBACK ---
-  if ( post_callback_.has_value() ) {
-    if ( !post_callback_.value()() ) {
+  if ( post_callback_locked_.has_value() ) {
+    if ( !post_callback_locked_.value()() ) {
       RCLCPP_WARN( node_->get_logger(), "Post-callback returned false." );
     }
   }

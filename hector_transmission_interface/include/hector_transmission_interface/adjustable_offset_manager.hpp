@@ -23,6 +23,32 @@ public:
   virtual double getOffset() const = 0;
 };
 
+/**
+ * @brief A lock that may or may not own anything, decided once at construction.
+ *
+ * The hardware mutex is optional - a caller that owns no hardware need not supply one - and that
+ * used to be expressed as a default-constructed unique_lock move-assigned into behind an if.
+ * Same behaviour, but acquisition and release then sat in different places. Here they are one
+ * object: whether it owns a lock is settled by the constructor and never changes.
+ */
+class OptionalCommLock
+{
+public:
+  explicit OptionalCommLock( const std::optional<std::reference_wrapper<std::mutex>> &mutex )
+  {
+    if ( mutex )
+      lock_.emplace( mutex->get() );
+  }
+
+  OptionalCommLock( const OptionalCommLock & ) = delete;
+  OptionalCommLock &operator=( const OptionalCommLock & ) = delete;
+
+  [[nodiscard]] bool owns_lock() const noexcept { return lock_.has_value(); }
+
+private:
+  std::optional<std::lock_guard<std::mutex>> lock_;
+};
+
 class AdjustableOffsetManager
 {
 public:
@@ -84,8 +110,16 @@ private:
 
   rclcpp::Node::SharedPtr node_;
   std::optional<std::reference_wrapper<std::mutex>> comm_mutex_;
-  std::optional<ServiceCallback> pre_callback_;
-  std::optional<ServiceCallback> post_callback_;
+
+  /// Runs BEFORE the hardware mutex is taken. It is expected to talk to the controller manager,
+  /// which needs the hardware free - so it must not assume any hardware state is stable, and it
+  /// may block.
+  std::optional<ServiceCallback> pre_callback_unlocked_;
+
+  /// Runs WHILE the hardware mutex is held. It may therefore touch hardware state directly, and
+  /// must not take that mutex again or call anything that does. Same rule for
+  /// ManagedJoint::position_getter, which is invoked from inside the same critical section.
+  std::optional<ServiceCallback> post_callback_locked_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::FlipByPi>::SharedPtr flip_by_pi_service_;
