@@ -571,3 +571,98 @@ TEST_F( AdjustableOffsetTransmissionTest, AdjustingEitherSideMovesBoth )
   EXPECT_NEAR( joint_pos, 0.5, 1e-9 );
   EXPECT_TRUE( fileContainsValue( -0.5 ) );
 }
+
+/**
+ * A power cycle does not shift the position by an arbitrary number of turns: the motor comes back
+ * reporting its absolute position within one known window (one turn wide, placed by the model's
+ * convention and its homing offset). Given that window, a correction is only ever the previous
+ * position wrapped into it. Anything else that happens to be a multiple of 2pi away is a real move.
+ */
+class ResetWindowTest : public AdjustableOffsetTransmissionTest
+{
+protected:
+  static constexpr double reduction = 2.0;
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  std::shared_ptr<JointOffset> offset;
+  std::unique_ptr<AdjustableOffsetTransmission> state;
+
+  void SetUp() override
+  {
+    AdjustableOffsetTransmissionTest::SetUp();
+    offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+    offset->setResetWindow( -M_PI ); // a signed single turn, as the PRO/P series report
+    state = std::make_unique<AdjustableOffsetTransmission>(
+        offset, AdjustableOffsetTransmission::Side::State, reduction );
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state->configure( jh, ah );
+  }
+
+  void readAt( double pos )
+  {
+    actuator_pos = pos;
+    state->actuator_to_joint();
+  }
+};
+
+TEST_F( ResetWindowTest, PowerCycleFromThreeTurnsOutIsCorrected )
+{
+  readAt( 3 * 2 * M_PI + 0.4 );
+  const double joint_before = joint_pos;
+
+  readAt( 0.4 ); // what the motor reports after it powers up there
+  EXPECT_EQ( state->getCorrectionCount(), 3 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, PowerCycleWrapsIntoTheWindowNotTowardsZero )
+{
+  readAt( 2 * M_PI - 0.2 ); // just below a full turn: its absolute position is -0.2
+  const double joint_before = joint_pos;
+
+  readAt( -0.2 );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, HandTurnLandingOutsideTheWindowIsAMove )
+{
+  readAt( 0.4 );
+  readAt( 0.4 + 2 * M_PI ); // a full actuator turn, but no motor reports that after a power cycle
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * M_PI ) / reduction, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, NearTwoPiDeltaWithBothReadingsInsideTheWindowIsAMove )
+{
+  readAt( -M_PI + 0.05 );
+  readAt( M_PI - 0.05 ); // 2pi - 0.1 further, yet a reset from there would have changed nothing
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( M_PI - 0.05 ) / reduction, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, WindowFollowsTheHomingOffset )
+{
+  // 3.5 rad is past +pi, so no unshifted motor reports it after a power cycle - but a motor with a
+  // homing offset of 1.0 does, its window being [-pi + 1, pi + 1).
+  offset->setResetWindow( -M_PI + 1.0 );
+  readAt( 3.5 + 2 * M_PI );
+  const double joint_before = joint_pos;
+  readAt( 3.5 );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+
+  auto unshifted = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
+  unshifted->setResetWindow( -M_PI );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 3.5 + 2 * M_PI, reduction ), 0 );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 3.5, reduction ), 0 );
+}
+
+TEST_F( ResetWindowTest, WithoutAWindowAnyTwoPiDeltaIsStillCorrected )
+{
+  auto bare = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
+  EXPECT_EQ( bare->observeActuatorPosition( 0.4, reduction ), 0 );
+  EXPECT_EQ( bare->observeActuatorPosition( 0.4 + 2 * M_PI, reduction ), 1 );
+}

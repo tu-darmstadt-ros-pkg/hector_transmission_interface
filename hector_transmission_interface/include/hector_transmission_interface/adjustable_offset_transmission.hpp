@@ -37,12 +37,25 @@ public:
   /**
    * \brief Feed one present actuator position to the jump detector.
    *
-   * When a Dynamixel actuator loses power it can come back with its position shifted by a
-   * multiple of 2pi. Such a shift since the previous reading is absorbed into the offset, so the
-   * joint position stays where it was.
+   * When a Dynamixel actuator loses power it comes back reporting its absolute position within a
+   * single turn, i.e. the position it had shifted by a multiple of 2pi. Such a shift since the
+   * previous reading is absorbed into the offset, so the joint position stays where it was.
+   *
+   * With a reset window set, only the one shift that lands the previous reading inside the window
+   * counts: any other multiple of 2pi is a real move and is reported, not corrected. Without a
+   * window every multiple of 2pi is taken for a reset.
    * @return the number of 2pi turns corrected (0 if nothing happened)
    */
   int observeActuatorPosition( double actuator_position, double reduction );
+
+  /**
+   * \brief Where this actuator's position lands after a power cycle: [lower_bound, lower_bound + 2pi).
+   *
+   * In actuator radians, homing offset included - e.g. -pi + homing_offset for a motor that
+   * reports a signed single turn, homing_offset for one that reports an unsigned one.
+   */
+  void setResetWindow( double lower_bound ) { reset_window_lower_ = lower_bound; }
+  const std::optional<double> &resetWindowLowerBound() const { return reset_window_lower_; }
 
   /// Restart the detector from this position: a deliberate offset change is not a jump.
   void rebaseDetector( double actuator_position ) { prev_actuator_position_ = actuator_position; }
@@ -59,7 +72,11 @@ private:
   std::filesystem::path transmission_file_path_;
   double offset_;
   std::optional<double> prev_actuator_position_;
+  std::optional<double> reset_window_lower_;
   int correction_count_{ 0 };
+
+  /// The number of turns a power cycle would have shifted the previous reading by, if any.
+  std::optional<int> turnsOfAReset( double previous, double current ) const;
 
   static constexpr double TWO_PI = 2.0 * M_PI;
   // Tolerance for detecting a 2pi jump (allow ~10% margin)
@@ -175,14 +192,37 @@ inline void JointOffset::set( double offset )
   saveTransmissionOffset();
 }
 
+inline std::optional<int> JointOffset::turnsOfAReset( double previous, double current ) const
+{
+  const double delta = current - previous;
+  const int n_turns = static_cast<int>( std::round( delta / TWO_PI ) );
+  if ( n_turns == 0 || std::abs( delta - n_turns * TWO_PI ) >= JUMP_TOLERANCE ) {
+    return std::nullopt; // not a whole number of turns apart
+  }
+  if ( !reset_window_lower_ ) {
+    return n_turns;
+  }
+  // A reset reports the previous position wrapped into the window - that one value, no other.
+  const double wrapped =
+      previous - TWO_PI * std::floor( ( previous - *reset_window_lower_ ) / TWO_PI );
+  if ( std::abs( current - wrapped ) < JUMP_TOLERANCE ) {
+    return n_turns;
+  }
+  RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+               "Actuator of joint '%s' moved %d x 2pi between two readings (%.4f -> %.4f rad) "
+               "without landing where a power cycle puts it ([%.4f, %.4f)). Treated as a real "
+               "move, not corrected.",
+               joint_name_.c_str(), n_turns, previous, current, *reset_window_lower_,
+               *reset_window_lower_ + TWO_PI );
+  return std::nullopt;
+}
+
 inline int JointOffset::observeActuatorPosition( double actuator_position, double reduction )
 {
   int n_jumps = 0;
   if ( prev_actuator_position_.has_value() ) {
-    const double delta = actuator_position - prev_actuator_position_.value();
-    // Round to the nearest integer multiple of 2pi
-    n_jumps = static_cast<int>( std::round( delta / TWO_PI ) );
-    if ( n_jumps != 0 && std::abs( delta - n_jumps * TWO_PI ) < JUMP_TOLERANCE ) {
+    if ( const auto turns = turnsOfAReset( *prev_actuator_position_, actuator_position ) ) {
+      n_jumps = *turns;
       // The jump in joint space is n_jumps * 2pi / reduction; absorb it into the offset.
       offset_ -= n_jumps * TWO_PI / reduction;
       correction_count_ += std::abs( n_jumps );
@@ -190,9 +230,8 @@ inline int JointOffset::observeActuatorPosition( double actuator_position, doubl
       RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                    "Detected %d x 2pi actuator position jump on joint '%s' "
                    "(actuator delta: %.4f rad). Corrected offset to %.6f.",
-                   n_jumps, joint_name_.c_str(), delta, offset_ );
-    } else {
-      n_jumps = 0;
+                   n_jumps, joint_name_.c_str(), actuator_position - *prev_actuator_position_,
+                   offset_ );
     }
   }
   prev_actuator_position_ = actuator_position;
