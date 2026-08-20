@@ -455,3 +455,60 @@ TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_JumpCorrectionStillW
   EXPECT_EQ( trans.getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
 }
+
+/**
+ * A joint has one state transmission (bound to the present values) and one command transmission
+ * (bound to the goal values). Whatever the wiring between them, one joint has one offset.
+ *
+ * Replays the hardware's reactivation sequence after a gap in which the actuator came back one
+ * turn away: the state side maps the fresh reading, then the goal is set to the present position
+ * and the command side maps it. Afterwards both sides must agree, else the controller's first
+ * command - seeded from the state - lands one actuator turn away from where the motor is.
+ */
+TEST_F( AdjustableOffsetTransmissionTest, StateAndCommandOffsetsAgreeAfterJumpAcrossGap )
+{
+  constexpr double reduction = 2.0;
+  double actuator_pos = 1.0, joint_pos = 0.0;
+  double actuator_goal = 1.0, joint_goal = 0.0;
+
+  auto state = std::make_shared<AdjustableOffsetTransmission>( joint_name, reduction, 0.0 );
+  auto command = std::make_shared<AdjustableOffsetTransmission>( joint_name, reduction, 0.0 );
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state->configure( jh, ah );
+  }
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+    command->configure( jh, ah );
+  }
+  // The manager's wiring: a correction on the state side is pushed to the command side.
+  state->setOffsetCorrectionCallback(
+      [command]( double new_offset ) { command->adjustTransmissionOffset( new_offset ); } );
+
+  // Activation: read, then goal := present.
+  state->actuator_to_joint();
+  actuator_goal = actuator_pos;
+  command->actuator_to_joint();
+
+  // Gap (e-stop). The actuator comes back one turn further.
+  actuator_pos = 1.0 + 2.0 * M_PI;
+
+  // Reactivation, in the hardware's order.
+  state->actuator_to_joint();
+  actuator_goal = actuator_pos;
+  command->actuator_to_joint();
+
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( state->get_joint_offset(), command->get_joint_offset(), 1e-9 );
+
+  // What the controller does on activation: command := state. The motor must not move.
+  joint_goal = joint_pos;
+  command->joint_to_actuator();
+  EXPECT_NEAR( actuator_goal, actuator_pos, 1e-9 );
+}
