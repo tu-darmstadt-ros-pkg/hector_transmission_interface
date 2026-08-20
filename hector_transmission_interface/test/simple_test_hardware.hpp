@@ -54,8 +54,12 @@ public:
       JointData data;
       data.name = name;
       // Create transmissions. In a real robot, parameters would come from URDF/INFO.
-      data.state_transmission = std::make_shared<AdjustableOffsetTransmission>( name, 1.0, 0.0 );
-      data.command_transmission = std::make_shared<AdjustableOffsetTransmission>( name, 1.0, 0.0 );
+      using Side = AdjustableOffsetTransmission::Side;
+      auto offset = std::make_shared<JointOffset>( name, 0.0 );
+      data.state_transmission =
+          std::make_shared<AdjustableOffsetTransmission>( offset, Side::State, 1.0 );
+      data.command_transmission =
+          std::make_shared<AdjustableOffsetTransmission>( offset, Side::Command, 1.0 );
       joints_[name] = data;
     }
 
@@ -130,9 +134,6 @@ public:
       actuator_handles.push_back( actuator_handle );
 
       joint.command_transmission->configure( joint_handles, actuator_handles );
-
-      // 5. Register Command Interface with Offset Manager
-      offset_manager_->add_joint_command_interface( name, joint.command_transmission );
     }
 
     return command_interfaces;

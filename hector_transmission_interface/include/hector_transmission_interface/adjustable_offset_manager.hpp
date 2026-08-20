@@ -55,10 +55,9 @@ public:
   using PositionGetter = std::function<double()>;
   using ServiceCallback = std::function<bool()>;
 
+  /// A joint has one offset, however many transmissions read it.
   struct ManagedJoint {
-    std::shared_ptr<IAdjustableOffset> state_handle;
-    std::shared_ptr<IAdjustableOffset> command_handle;
-    std::shared_ptr<AdjustableOffsetTransmission> state_transmission;
+    std::shared_ptr<IAdjustableOffset> handle;
     PositionGetter position_getter;
   };
 
@@ -69,7 +68,10 @@ public:
       std::optional<ServiceCallback> post_callback = std::nullopt );
 
   /**
-   * @brief Add state interface for a joint
+   * @brief Manage a joint's offset through its state transmission.
+   *
+   * Ignored unless the transmission is an AdjustableOffsetTransmission. The command transmission
+   * needs no registration: it shares the state transmission's JointOffset.
    * @param name Joint name
    * @param state_tx State transmission
    * @param position_getter Function to get current position
@@ -78,26 +80,9 @@ public:
                                   std::shared_ptr<transmission_interface::Transmission> state_tx,
                                   PositionGetter position_getter );
 
-  /**
-   * @brief Add command interface for a joint
-   * @param name Joint name
-   * @param command_tx Command transmission
-   */
-  void add_joint_command_interface( const std::string &name,
-                                    std::shared_ptr<transmission_interface::Transmission> command_tx );
-
   void add_managed_joint( const std::string &name, ManagedJoint mj );
 
 private:
-  /**
-   * @brief Wire the 2pi jump correction callback for a joint (if both handles are registered).
-   *
-   * When both state and command interfaces are registered for a joint, this sets up
-   * a callback on the state transmission that automatically syncs the command transmission
-   * offset whenever a 2pi jump correction is applied.
-   */
-  void setupJumpCorrectionCallback( const std::string &name );
-
   void handle_service(
       const std::shared_ptr<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Request>
           request,

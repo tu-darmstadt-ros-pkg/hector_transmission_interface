@@ -458,7 +458,7 @@ TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_JumpCorrectionStillW
 
 /**
  * A joint has one state transmission (bound to the present values) and one command transmission
- * (bound to the goal values). Whatever the wiring between them, one joint has one offset.
+ * (bound to the goal values), and one offset between them.
  *
  * Replays the hardware's reactivation sequence after a gap in which the actuator came back one
  * turn away: the state side maps the fresh reading, then the goal is set to the present position
@@ -471,8 +471,10 @@ TEST_F( AdjustableOffsetTransmissionTest, StateAndCommandOffsetsAgreeAfterJumpAc
   double actuator_pos = 1.0, joint_pos = 0.0;
   double actuator_goal = 1.0, joint_goal = 0.0;
 
-  auto state = std::make_shared<AdjustableOffsetTransmission>( joint_name, reduction, 0.0 );
-  auto command = std::make_shared<AdjustableOffsetTransmission>( joint_name, reduction, 0.0 );
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  auto state = std::make_shared<AdjustableOffsetTransmission>( offset, Side::State, reduction );
+  auto command = std::make_shared<AdjustableOffsetTransmission>( offset, Side::Command, reduction );
   {
     std::vector<transmission_interface::JointHandle> jh{
         { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
@@ -487,10 +489,6 @@ TEST_F( AdjustableOffsetTransmissionTest, StateAndCommandOffsetsAgreeAfterJumpAc
         { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
     command->configure( jh, ah );
   }
-  // The manager's wiring: a correction on the state side is pushed to the command side.
-  state->setOffsetCorrectionCallback(
-      [command]( double new_offset ) { command->adjustTransmissionOffset( new_offset ); } );
-
   // Activation: read, then goal := present.
   state->actuator_to_joint();
   actuator_goal = actuator_pos;
@@ -511,4 +509,65 @@ TEST_F( AdjustableOffsetTransmissionTest, StateAndCommandOffsetsAgreeAfterJumpAc
   joint_goal = joint_pos;
   command->joint_to_actuator();
   EXPECT_NEAR( actuator_goal, actuator_pos, 1e-9 );
+}
+
+/**
+ * The goal trajectory is not an actuator reading. A goal that moves by one turn - say a reset to
+ * the present position after the state side absorbed a jump - is not a jump of its own.
+ */
+TEST_F( AdjustableOffsetTransmissionTest, CommandSideDoesNotRunTheJumpDetector )
+{
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  double actuator_goal = 0.0, joint_goal = 0.0;
+  AdjustableOffsetTransmission command( offset, Side::Command, 2.0 );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+  command.configure( jh, ah );
+
+  command.actuator_to_joint();
+  actuator_goal = 2.0 * M_PI;
+  command.actuator_to_joint();
+
+  EXPECT_EQ( command.getCorrectionCount(), 0 );
+  EXPECT_DOUBLE_EQ( offset->value(), 0.0 );
+  EXPECT_NEAR( joint_goal, M_PI, 1e-9 );
+}
+
+/// Both sides see a service adjustment at once: there is only one number to adjust.
+TEST_F( AdjustableOffsetTransmissionTest, AdjustingEitherSideMovesBoth )
+{
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  double actuator_pos = 1.0, joint_pos = 0.0, actuator_goal = 1.0, joint_goal = 0.0;
+  AdjustableOffsetTransmission state( offset, Side::State, 1.0 );
+  AdjustableOffsetTransmission command( offset, Side::Command, 1.0 );
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state.configure( jh, ah );
+  }
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+    command.configure( jh, ah );
+  }
+
+  state.adjustTransmissionOffset( 0.25 );
+  EXPECT_DOUBLE_EQ( command.get_joint_offset(), 0.25 );
+  joint_goal = 1.0;
+  command.joint_to_actuator();
+  EXPECT_NEAR( actuator_goal, 0.75, 1e-9 );
+
+  command.adjustTransmissionOffset( -0.5 );
+  EXPECT_DOUBLE_EQ( state.get_joint_offset(), -0.5 );
+  state.actuator_to_joint();
+  EXPECT_NEAR( joint_pos, 0.5, 1e-9 );
+  EXPECT_TRUE( fileContainsValue( -0.5 ) );
 }

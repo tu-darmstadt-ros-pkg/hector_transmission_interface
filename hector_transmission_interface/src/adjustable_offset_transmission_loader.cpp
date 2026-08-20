@@ -52,34 +52,67 @@ std::vector<std::string> parseInterfaceList( const std::string &value )
 }
 } // namespace
 
+namespace
+{
+struct ParsedInfo {
+  std::string joint_name;
+  double reduction;
+  double offset;
+  bool pass_through_effort = false;
+  std::vector<std::string> pass_through_interfaces;
+};
+
+ParsedInfo parse( const hardware_interface::TransmissionInfo &transmission_info )
+{
+  const auto &joint_info = transmission_info.joints.at( 0 );
+  ParsedInfo parsed{ joint_info.name, joint_info.mechanical_reduction, joint_info.offset };
+  const auto pte_it = transmission_info.parameters.find( "pass_through_effort" );
+  if ( pte_it != transmission_info.parameters.end() ) {
+    parsed.pass_through_effort = parseBoolParam( pte_it->second );
+  }
+  const auto pti_it = transmission_info.parameters.find( "pass_through_interfaces" );
+  if ( pti_it != transmission_info.parameters.end() ) {
+    parsed.pass_through_interfaces = parseInterfaceList( pti_it->second );
+  }
+  return parsed;
+}
+
+void logFailure( const std::exception &ex )
+{
+  RCLCPP_ERROR( rclcpp::get_logger( "adjustable_offset_transmission_loader" ),
+                "Failed to construct transmission '%s'", ex.what() );
+}
+} // namespace
+
 std::shared_ptr<transmission_interface::Transmission> AdjustableOffsetTransmissionLoader::load(
     const hardware_interface::TransmissionInfo &transmission_info )
 {
   try {
-    const auto &joint_info = transmission_info.joints.at( 0 );
-    const auto mechanical_reduction = joint_info.mechanical_reduction;
-    const auto offset = joint_info.offset;
-    const auto joint_name = joint_info.name;
-
-    bool pass_through_effort = false;
-    std::vector<std::string> pass_through_interfaces;
-    const auto pte_it = transmission_info.parameters.find( "pass_through_effort" );
-    if ( pte_it != transmission_info.parameters.end() ) {
-      pass_through_effort = parseBoolParam( pte_it->second );
-    }
-    const auto pti_it = transmission_info.parameters.find( "pass_through_interfaces" );
-    if ( pti_it != transmission_info.parameters.end() ) {
-      pass_through_interfaces = parseInterfaceList( pti_it->second );
-    }
-
-    std::shared_ptr<transmission_interface::Transmission> transmission(
-        new AdjustableOffsetTransmission( joint_name, mechanical_reduction, offset,
-                                          pass_through_effort,
-                                          std::move( pass_through_interfaces ) ) );
-    return transmission;
+    auto info = parse( transmission_info );
+    return std::make_shared<AdjustableOffsetTransmission>(
+        info.joint_name, info.reduction, info.offset, info.pass_through_effort,
+        std::move( info.pass_through_interfaces ) );
   } catch ( const std::exception &ex ) {
-    RCLCPP_ERROR( rclcpp::get_logger( "simple_transmission_loader" ),
-                  "Failed to construct transmission '%s'", ex.what() );
+    logFailure( ex );
+    return {};
+  }
+}
+
+AdjustableOffsetTransmissionLoader::Pair AdjustableOffsetTransmissionLoader::loadPair(
+    const hardware_interface::TransmissionInfo &transmission_info )
+{
+  try {
+    const auto info = parse( transmission_info );
+    auto offset = std::make_shared<JointOffset>( info.joint_name, info.offset );
+    using Side = AdjustableOffsetTransmission::Side;
+    return { std::make_shared<AdjustableOffsetTransmission>( offset, Side::State, info.reduction,
+                                                             info.pass_through_effort,
+                                                             info.pass_through_interfaces ),
+             std::make_shared<AdjustableOffsetTransmission>( offset, Side::Command, info.reduction,
+                                                             info.pass_through_effort,
+                                                             info.pass_through_interfaces ) };
+  } catch ( const std::exception &ex ) {
+    logFailure( ex );
     return {};
   }
 }

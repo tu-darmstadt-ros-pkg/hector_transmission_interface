@@ -19,15 +19,74 @@
 
 namespace hector_transmission_interface
 {
+/**
+ * \brief The offset of one joint, and the state of the 2pi jump detector that maintains it.
+ *
+ * A joint is served by two transmissions - one bound to its present values, one to its goals -
+ * and they must agree on the offset at every instant, so the offset lives here and both hold a
+ * pointer to it. Persisted to ~/.ros/dynamic_offset_transmissions/<joint>.txt.
+ */
+class JointOffset
+{
+public:
+  explicit JointOffset( const std::string &joint_name, double initial_offset );
+
+  double value() const { return offset_; }
+  void set( double offset );
+
+  /**
+   * \brief Feed one present actuator position to the jump detector.
+   *
+   * When a Dynamixel actuator loses power it can come back with its position shifted by a
+   * multiple of 2pi. Such a shift since the previous reading is absorbed into the offset, so the
+   * joint position stays where it was.
+   * @return the number of 2pi turns corrected (0 if nothing happened)
+   */
+  int observeActuatorPosition( double actuator_position, double reduction );
+
+  /// Restart the detector from this position: a deliberate offset change is not a jump.
+  void rebaseDetector( double actuator_position ) { prev_actuator_position_ = actuator_position; }
+
+  int correctionCount() const { return correction_count_; }
+  const std::string &jointName() const { return joint_name_; }
+
+private:
+  bool existsTransmissionOffsetFile() const;
+  void loadTransmissionOffset();
+  void saveTransmissionOffset() const;
+
+  std::string joint_name_;
+  std::filesystem::path transmission_file_path_;
+  double offset_;
+  std::optional<double> prev_actuator_position_;
+  int correction_count_{ 0 };
+
+  static constexpr double TWO_PI = 2.0 * M_PI;
+  // Tolerance for detecting a 2pi jump (allow ~10% margin)
+  static constexpr double JUMP_TOLERANCE = 0.2 * M_PI;
+};
+
 class AdjustableOffsetTransmission : public transmission_interface::SimpleTransmission
 {
 public:
-  using OffsetCorrectionCallback = std::function<void( double new_offset )>;
+  /**
+   * Which of a joint's two transmissions this is. Only the one bound to the PRESENT values sees
+   * real actuator readings, so only it feeds the jump detector; the one bound to the goals just
+   * maps with whatever offset the joint has.
+   */
+  enum class Side { State, Command };
 
+  /// A transmission owning a fresh JointOffset for the joint: the state side of a lone instance.
   explicit AdjustableOffsetTransmission( const std::string &joint_name,
                                          double joint_to_actuator_reduction,
                                          double joint_offset = 0.0, bool pass_through_effort = false,
                                          std::vector<std::string> pass_through_interfaces = {} );
+
+  /// One of the two transmissions sharing a joint's offset.
+  AdjustableOffsetTransmission( std::shared_ptr<JointOffset> offset, Side side,
+                                double joint_to_actuator_reduction, bool pass_through_effort = false,
+                                std::vector<std::string> pass_through_interfaces = {} );
+
   /***
    * \brief
    * Adjusts the transmission offset for the joint.
@@ -36,6 +95,11 @@ public:
    * @param offset The new offset to set for the joint.
    */
   void adjustTransmissionOffset( double offset );
+
+  /// The joint's offset. Hides SimpleTransmission's copy, which is only a cache of this.
+  double get_joint_offset() const { return offset_->value(); }
+  const std::shared_ptr<JointOffset> &jointOffset() const { return offset_; }
+  Side side() const { return side_; }
 
   /**
    * \brief Override configure to optionally route effort/torque/force and arbitrary
@@ -51,14 +115,10 @@ public:
                   const std::vector<transmission_interface::ActuatorHandle> &actuator_handles ) override;
 
   /**
-   * \brief Override actuator_to_joint to detect and correct 2pi jumps on the actuator side.
+   * \brief Map actuator to joint values with the joint's offset.
    *
-   * When a Dynamixel actuator briefly loses power, it can lose its absolute position
-   * and reset by a multiple of 2pi. On the joint side (with a transmission ratio),
-   * this manifests as a jump of 2pi/reduction. This method detects such jumps
-   * and compensates by adjusting the joint offset.
-   *
-   * Also identity-copies any passthrough interfaces from actuator to joint side.
+   * On the state side the actuator position is first shown to the jump detector, which may
+   * change the offset. Also identity-copies any passthrough interfaces from actuator to joint.
    */
   void actuator_to_joint() override;
 
@@ -69,33 +129,16 @@ public:
   void joint_to_actuator() override;
 
   /**
-   * \brief Returns the number of 2pi corrections applied since construction (for diagnostics).
+   * \brief Returns the number of 2pi corrections applied to this joint's offset (for diagnostics).
    */
-  int getCorrectionCount() const { return correction_count_; }
-
-  /**
-   * \brief Register a callback that is invoked when a 2pi jump correction is applied.
-   *
-   * The callback receives the corrected offset value. This is used by the
-   * AdjustableOffsetManager to automatically synchronize the command transmission.
-   */
-  void setOffsetCorrectionCallback( OffsetCorrectionCallback callback )
-  {
-    offset_correction_callback_ = std::move( callback );
-  }
+  int getCorrectionCount() const { return offset_->correctionCount(); }
 
 private:
-  bool existsTransmissionOffsetFile() const;
-  void loadTransmissionOffset();
-  void saveTransmissionOffset() const;
+  /// SimpleTransmission computes with its own jnt_offset_; refresh it from the shared value.
+  void syncBaseOffset() { jnt_offset_ = offset_->value(); }
 
-  std::string joint_name_;
-  std::filesystem::path transmission_file_path_;
-
-  // 2pi jump detection state
-  std::optional<double> prev_actuator_position_;
-  int correction_count_{ 0 };
-  OffsetCorrectionCallback offset_correction_callback_;
+  std::shared_ptr<JointOffset> offset_;
+  Side side_;
 
   // Passthrough configuration
   bool pass_through_effort_;
@@ -104,41 +147,64 @@ private:
   // should be identity-copied in both directions instead of being scaled by reduction.
   std::vector<std::pair<transmission_interface::JointHandle, transmission_interface::ActuatorHandle>>
       passthrough_pairs_;
-
-  static constexpr double TWO_PI = 2.0 * M_PI;
-  // Tolerance for detecting a 2pi jump (allow ~10% margin)
-  static constexpr double JUMP_TOLERANCE = 0.2 * M_PI;
 };
 
-inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
-    const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset,
-    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
-    : SimpleTransmission( joint_to_actuator_reduction, joint_offset ), joint_name_( joint_name ),
-      pass_through_effort_( pass_through_effort ),
-      pass_through_interface_names_( std::move( pass_through_interfaces ) )
+// ---------------------------------------------------------------------------------------------
+// JointOffset
+
+inline JointOffset::JointOffset( const std::string &joint_name, double initial_offset )
+    : joint_name_( joint_name ), offset_( initial_offset )
 {
-  // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
   transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
-  const auto old_offset = get_joint_offset();
   if ( existsTransmissionOffsetFile() ) {
     loadTransmissionOffset();
   } else {
     saveTransmissionOffset(); // save the initial offset to file
   }
-  if ( old_offset != get_joint_offset() ) {
+  if ( initial_offset != offset_ ) {
     RCLCPP_INFO( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                  "Loaded transmission offset for joint '%s': %f from file %s", joint_name_.c_str(),
-                 get_joint_offset(), transmission_file_path_.c_str() );
+                 offset_, transmission_file_path_.c_str() );
   }
 }
 
-inline bool AdjustableOffsetTransmission::existsTransmissionOffsetFile() const
+inline void JointOffset::set( double offset )
+{
+  offset_ = offset;
+  saveTransmissionOffset();
+}
+
+inline int JointOffset::observeActuatorPosition( double actuator_position, double reduction )
+{
+  int n_jumps = 0;
+  if ( prev_actuator_position_.has_value() ) {
+    const double delta = actuator_position - prev_actuator_position_.value();
+    // Round to the nearest integer multiple of 2pi
+    n_jumps = static_cast<int>( std::round( delta / TWO_PI ) );
+    if ( n_jumps != 0 && std::abs( delta - n_jumps * TWO_PI ) < JUMP_TOLERANCE ) {
+      // The jump in joint space is n_jumps * 2pi / reduction; absorb it into the offset.
+      offset_ -= n_jumps * TWO_PI / reduction;
+      correction_count_ += std::abs( n_jumps );
+      saveTransmissionOffset();
+      RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                   "Detected %d x 2pi actuator position jump on joint '%s' "
+                   "(actuator delta: %.4f rad). Corrected offset to %.6f.",
+                   n_jumps, joint_name_.c_str(), delta, offset_ );
+    } else {
+      n_jumps = 0;
+    }
+  }
+  prev_actuator_position_ = actuator_position;
+  return n_jumps;
+}
+
+inline bool JointOffset::existsTransmissionOffsetFile() const
 {
   return std::filesystem::exists( transmission_file_path_ );
 }
 
-inline void AdjustableOffsetTransmission::loadTransmissionOffset()
+inline void JointOffset::loadTransmissionOffset()
 {
   // Load the transmission offset from the specified storage path
   if ( std::filesystem::exists( transmission_file_path_ ) ) {
@@ -151,7 +217,7 @@ inline void AdjustableOffsetTransmission::loadTransmissionOffset()
                       "Failed to read a valid offset from file: %s",
                       transmission_file_path_.string().c_str() );
       } else {
-        jnt_offset_ = offset;
+        offset_ = offset;
       }
       file.close();
     } else {
@@ -166,13 +232,13 @@ inline void AdjustableOffsetTransmission::loadTransmissionOffset()
   }
 }
 
-inline void AdjustableOffsetTransmission::saveTransmissionOffset() const
+inline void JointOffset::saveTransmissionOffset() const
 {
   // Save the current transmission offset to the specified storage path
   std::filesystem::create_directories( transmission_file_path_.parent_path() );
   std::ofstream file( transmission_file_path_ );
   if ( file.is_open() ) {
-    file << jnt_offset_;
+    file << offset_;
     if ( file.fail() ) {
       RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Failed to write offset to file: %s", transmission_file_path_.string().c_str() );
@@ -185,38 +251,33 @@ inline void AdjustableOffsetTransmission::saveTransmissionOffset() const
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// AdjustableOffsetTransmission
+
+inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
+    const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset,
+    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
+    : AdjustableOffsetTransmission( std::make_shared<JointOffset>( joint_name, joint_offset ),
+                                    Side::State, joint_to_actuator_reduction, pass_through_effort,
+                                    std::move( pass_through_interfaces ) )
+{
+}
+
+inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
+    std::shared_ptr<JointOffset> offset, Side side, double joint_to_actuator_reduction,
+    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
+    : SimpleTransmission( joint_to_actuator_reduction, offset->value() ),
+      offset_( std::move( offset ) ), side_( side ), pass_through_effort_( pass_through_effort ),
+      pass_through_interface_names_( std::move( pass_through_interfaces ) )
+{
+}
+
 inline void AdjustableOffsetTransmission::actuator_to_joint()
 {
-  // Read the current actuator position before the base transform
-  if ( actuator_position_ && prev_actuator_position_.has_value() ) {
-    double current_actuator_pos = actuator_position_.get_value();
-    double delta = current_actuator_pos - prev_actuator_position_.value();
-
-    // Check if the jump is close to a multiple of 2pi
-    // Round to nearest integer multiple of 2pi
-    double n_jumps_raw = delta / TWO_PI;
-    int n_jumps = static_cast<int>( std::round( n_jumps_raw ) );
-
-    if ( n_jumps != 0 && std::abs( delta - n_jumps * TWO_PI ) < JUMP_TOLERANCE ) {
-      // Detected a 2pi jump on the actuator side.
-      // Compensate in the joint offset: the jump in joint space is n_jumps * 2pi / reduction
-      double joint_space_correction = n_jumps * TWO_PI / reduction_;
-      jnt_offset_ -= joint_space_correction;
-      correction_count_ += std::abs( n_jumps );
-      saveTransmissionOffset();
-
-      RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                   "Detected %d x 2pi actuator position jump on joint '%s' "
-                   "(actuator delta: %.4f rad). Corrected offset to %.6f.",
-                   n_jumps, joint_name_.c_str(), delta, jnt_offset_ );
-
-      if ( offset_correction_callback_ ) {
-        offset_correction_callback_( jnt_offset_ );
-      }
-    }
+  if ( side_ == Side::State && actuator_position_ ) {
+    offset_->observeActuatorPosition( actuator_position_.get_value(), reduction_ );
   }
-
-  // Perform the standard transform (uses possibly-updated jnt_offset_)
+  syncBaseOffset();
   SimpleTransmission::actuator_to_joint();
 
   // Identity-copy any passthrough interfaces from actuator to joint side.
@@ -225,15 +286,11 @@ inline void AdjustableOffsetTransmission::actuator_to_joint()
       joint_handle.set_value( actuator_handle.get_value() );
     }
   }
-
-  // Track actuator position for next cycle's jump detection
-  if ( actuator_position_ ) {
-    prev_actuator_position_ = actuator_position_.get_value();
-  }
 }
 
 inline void AdjustableOffsetTransmission::joint_to_actuator()
 {
+  syncBaseOffset();
   SimpleTransmission::joint_to_actuator();
 
   // Identity-copy any passthrough interfaces from joint to actuator side.
@@ -297,13 +354,13 @@ inline void AdjustableOffsetTransmission::configure(
       RCLCPP_DEBUG( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Passthrough joint handle '%s' on joint '%s' has no matching actuator handle; "
                     "dropping.",
-                    name.c_str(), joint_name_.c_str() );
+                    name.c_str(), offset_->jointName().c_str() );
       continue;
     }
     if ( !joint_handle || !*it ) {
       RCLCPP_DEBUG( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Passthrough handle pair '%s' on joint '%s' has nullptr backing; dropping.",
-                    name.c_str(), joint_name_.c_str() );
+                    name.c_str(), offset_->jointName().c_str() );
       continue;
     }
     passthrough_pairs_.emplace_back( joint_handle, *it );
@@ -312,14 +369,12 @@ inline void AdjustableOffsetTransmission::configure(
 
 inline void AdjustableOffsetTransmission::adjustTransmissionOffset( double offset )
 {
-  jnt_offset_ = offset;
-  saveTransmissionOffset();
-  actuator_to_joint(); // update joint state based on new offset
-
-  // Reset jump detection to avoid false positive after manual offset change
-  if ( actuator_position_ ) {
-    prev_actuator_position_ = actuator_position_.get_value();
+  offset_->set( offset );
+  // A deliberate change is not a jump: whatever the state side reads next is the new baseline.
+  if ( side_ == Side::State && actuator_position_ ) {
+    offset_->rebaseDetector( actuator_position_.get_value() );
   }
+  actuator_to_joint(); // update the joint side with the new offset
 }
 } // namespace hector_transmission_interface
 #endif // DYNAMIC_OFFSET_TRANSMISSION_HPP
