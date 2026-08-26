@@ -661,32 +661,47 @@ TEST_F( ResetWindowTest, HandTurnBackwardsIsAMove )
 // after a power cycle, so an exact window would call this a move - but an unsigned-turn one does,
 // and nothing readable off the motor says which this is. Correcting is the safe reading of the
 // two: it keeps the joint where it was rather than jumping it a turn.
-TEST_F( ResetWindowTest, SingleForwardTurnIsIndistinguishableFromAPowerCycle )
+// What the union still cannot decide, and it is half of a turn rather than all of it. Below the
+// homing offset the signed and unsigned representations disagree - a signed motor reports the
+// reading unchanged, an unsigned one reports it a turn higher - so a forward turn by hand lands
+// exactly where a power cycle would. Correcting is the safer reading: it keeps the joint where it
+// was rather than jumping it a turn.
+TEST_F( ResetWindowTest, ForwardTurnFromBelowTheHomingOffsetIsIndistinguishable )
 {
-  readAt( 0.4 );
+  readAt( -0.5 );
   const double joint_before = joint_pos;
-  readAt( 0.4 + 2 * M_PI );
+  readAt( -0.5 + 2 * M_PI );
   EXPECT_EQ( state->getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
 }
 
+// Above the homing offset the two representations agree, and both leave the reading untouched. No
+// power cycle can produce a jump from there, so a forward turn by hand is decidable after all.
+TEST_F( ResetWindowTest, ForwardTurnFromAboveTheHomingOffsetIsAMove )
+{
+  readAt( 0.4 );
+  readAt( 0.4 + 2 * M_PI );
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * M_PI ) / reduction, 1e-9 );
+}
+
 TEST_F( ResetWindowTest, WindowFollowsTheHomingOffset )
 {
-  // 7.5 rad is past the top of an unshifted window, so no unshifted motor reports it after a power
+  // 6.8 rad is past the top of an unshifted window, so no unshifted motor reports it after a power
   // cycle - but a motor with a homing offset of 1.0 does, its window reaching 1 + 2pi.
   const auto [lower, upper] = unionWindow( 1.0 );
   offset->setResetWindow( lower, upper );
-  readAt( 7.5 + 2 * M_PI );
+  readAt( 6.8 + 2 * M_PI );
   const double joint_before = joint_pos;
-  readAt( 7.5 );
+  readAt( 6.8 );
   EXPECT_EQ( state->getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
 
   auto unshifted = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
   const auto [unshifted_lower, unshifted_upper] = unionWindow( 0.0 );
   unshifted->setResetWindow( unshifted_lower, unshifted_upper );
-  EXPECT_EQ( unshifted->observeActuatorPosition( 7.5 + 2 * M_PI, reduction ), 0 );
-  EXPECT_EQ( unshifted->observeActuatorPosition( 7.5, reduction ), 0 );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 6.8 + 2 * M_PI, reduction ), 0 );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 6.8, reduction ), 0 );
 }
 
 TEST_F( ResetWindowTest, WithoutAWindowAnyTwoPiDeltaIsStillCorrected )

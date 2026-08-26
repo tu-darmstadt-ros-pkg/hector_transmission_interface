@@ -206,12 +206,18 @@ inline std::optional<int> JointOffset::turnsOfAReset( double previous, double cu
   if ( !reset_window_ ) {
     return n_turns;
   }
-  // current is already a whole number of turns from previous, so the only question left is whether
-  // a power cycle could have put it here. The tolerance is the same slop the delta test above
-  // allowed, carried over so a reading at the edge is not rejected for measurement noise.
+  // A power cycle reports the previous position wrapped into the window, so the readings it could
+  // produce are the ones congruent to previous that lie there: one value for a window a single turn
+  // wide, two for the union of a signed and an unsigned turn. Asking only whether current falls in
+  // the window would also admit everything between those values, which on a wider window is most of
+  // a turn of real movement. The tolerance is the slop the delta test above already allowed, so a
+  // candidate is not missed for measurement noise.
   const auto &[lower, upper] = *reset_window_;
-  if ( current >= lower - JUMP_TOLERANCE && current < upper + JUMP_TOLERANCE ) {
-    return n_turns;
+  for ( double candidate = previous - TWO_PI * std::floor( ( previous - lower ) / TWO_PI );
+        candidate < upper; candidate += TWO_PI ) {
+    if ( std::abs( current - candidate ) < JUMP_TOLERANCE ) {
+      return n_turns;
+    }
   }
   RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                "Actuator of joint '%s' moved %d x 2pi between two readings (%.4f -> %.4f rad) "
