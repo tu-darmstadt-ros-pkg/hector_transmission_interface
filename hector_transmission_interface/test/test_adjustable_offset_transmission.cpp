@@ -574,9 +574,14 @@ TEST_F( AdjustableOffsetTransmissionTest, AdjustingEitherSideMovesBoth )
 
 /**
  * A power cycle does not shift the position by an arbitrary number of turns: the motor comes back
- * reporting its absolute position within one known window (one turn wide, placed by the model's
- * convention and its homing offset). Given that window, a correction is only ever the previous
- * position wrapped into it. Anything else that happens to be a multiple of 2pi away is a real move.
+ * reporting its absolute position within one turn of its homing offset. Which turn is a matter of
+ * representation - signed puts it in [-pi, pi), unsigned in [0, 2pi) - and no datasheet says which
+ * a given model uses. The caller therefore bounds the union of the two, [-pi, 2pi) about the
+ * homing offset.
+ *
+ * A 3pi window admits at most two of the candidate shifts where an exact 2pi one admits exactly
+ * one, so a single forward turn by hand is no longer distinguishable from a power cycle. Every
+ * other multiple of 2pi still is, and an unbounded detector distinguishes none of them.
  */
 class ResetWindowTest : public AdjustableOffsetTransmissionTest
 {
@@ -586,11 +591,18 @@ protected:
   std::shared_ptr<JointOffset> offset;
   std::unique_ptr<AdjustableOffsetTransmission> state;
 
+  /// The union window for a motor whose homing offset is `homing_offset`.
+  static std::pair<double, double> unionWindow( double homing_offset )
+  {
+    return { homing_offset - M_PI, homing_offset + 2 * M_PI };
+  }
+
   void SetUp() override
   {
     AdjustableOffsetTransmissionTest::SetUp();
     offset = std::make_shared<JointOffset>( joint_name, 0.0 );
-    offset->setResetWindow( -M_PI ); // a signed single turn, as the PRO/P series report
+    const auto [lower, upper] = unionWindow( 0.0 );
+    offset->setResetWindow( lower, upper );
     state = std::make_unique<AdjustableOffsetTransmission>(
         offset, AdjustableOffsetTransmission::Side::State, reduction );
     std::vector<transmission_interface::JointHandle> jh{
@@ -627,37 +639,54 @@ TEST_F( ResetWindowTest, PowerCycleWrapsIntoTheWindowNotTowardsZero )
   EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
 }
 
-TEST_F( ResetWindowTest, HandTurnLandingOutsideTheWindowIsAMove )
+TEST_F( ResetWindowTest, HandTurnOfTwoTurnsIsAMove )
 {
   readAt( 0.4 );
-  readAt( 0.4 + 2 * M_PI ); // a full actuator turn, but no motor reports that after a power cycle
+  readAt( 0.4 + 2 * 2 * M_PI ); // two turns out is past the window under either representation
   EXPECT_EQ( state->getCorrectionCount(), 0 );
-  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * M_PI ) / reduction, 1e-9 );
+  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * 2 * M_PI ) / reduction, 1e-9 );
 }
 
-TEST_F( ResetWindowTest, NearTwoPiDeltaWithBothReadingsInsideTheWindowIsAMove )
+TEST_F( ResetWindowTest, HandTurnBackwardsIsAMove )
 {
-  readAt( -M_PI + 0.05 );
-  readAt( M_PI - 0.05 ); // 2pi - 0.1 further, yet a reset from there would have changed nothing
+  // The union is not symmetric: it reaches one turn up from the homing offset but only half a turn
+  // down, so a backward turn still falls outside it.
+  readAt( 0.4 );
+  readAt( 0.4 - 2 * M_PI );
   EXPECT_EQ( state->getCorrectionCount(), 0 );
-  EXPECT_NEAR( joint_pos, ( M_PI - 0.05 ) / reduction, 1e-9 );
+  EXPECT_NEAR( joint_pos, ( 0.4 - 2 * M_PI ) / reduction, 1e-9 );
+}
+
+// The price of not naming a representation per model. A signed-turn motor never reports 0.4 + 2pi
+// after a power cycle, so an exact window would call this a move - but an unsigned-turn one does,
+// and nothing readable off the motor says which this is. Correcting is the safe reading of the
+// two: it keeps the joint where it was rather than jumping it a turn.
+TEST_F( ResetWindowTest, SingleForwardTurnIsIndistinguishableFromAPowerCycle )
+{
+  readAt( 0.4 );
+  const double joint_before = joint_pos;
+  readAt( 0.4 + 2 * M_PI );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
 }
 
 TEST_F( ResetWindowTest, WindowFollowsTheHomingOffset )
 {
-  // 3.5 rad is past +pi, so no unshifted motor reports it after a power cycle - but a motor with a
-  // homing offset of 1.0 does, its window being [-pi + 1, pi + 1).
-  offset->setResetWindow( -M_PI + 1.0 );
-  readAt( 3.5 + 2 * M_PI );
+  // 7.5 rad is past the top of an unshifted window, so no unshifted motor reports it after a power
+  // cycle - but a motor with a homing offset of 1.0 does, its window reaching 1 + 2pi.
+  const auto [lower, upper] = unionWindow( 1.0 );
+  offset->setResetWindow( lower, upper );
+  readAt( 7.5 + 2 * M_PI );
   const double joint_before = joint_pos;
-  readAt( 3.5 );
+  readAt( 7.5 );
   EXPECT_EQ( state->getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
 
   auto unshifted = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
-  unshifted->setResetWindow( -M_PI );
-  EXPECT_EQ( unshifted->observeActuatorPosition( 3.5 + 2 * M_PI, reduction ), 0 );
-  EXPECT_EQ( unshifted->observeActuatorPosition( 3.5, reduction ), 0 );
+  const auto [unshifted_lower, unshifted_upper] = unionWindow( 0.0 );
+  unshifted->setResetWindow( unshifted_lower, unshifted_upper );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 7.5 + 2 * M_PI, reduction ), 0 );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 7.5, reduction ), 0 );
 }
 
 TEST_F( ResetWindowTest, WithoutAWindowAnyTwoPiDeltaIsStillCorrected )

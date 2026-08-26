@@ -41,21 +41,25 @@ public:
    * single turn, i.e. the position it had shifted by a multiple of 2pi. Such a shift since the
    * previous reading is absorbed into the offset, so the joint position stays where it was.
    *
-   * With a reset window set, only the one shift that lands the previous reading inside the window
-   * counts: any other multiple of 2pi is a real move and is reported, not corrected. Without a
-   * window every multiple of 2pi is taken for a reset.
+   * With a reset window set, only a shift that lands the reading inside the window counts: any
+   * other multiple of 2pi is a real move and is reported, not corrected. Without a window every
+   * multiple of 2pi is taken for a reset.
    * @return the number of 2pi turns corrected (0 if nothing happened)
    */
   int observeActuatorPosition( double actuator_position, double reduction );
 
   /**
-   * \brief Where this actuator's position lands after a power cycle: [lower_bound, lower_bound + 2pi).
+   * \brief The interval a power cycle can leave this actuator's position in, in actuator radians.
    *
-   * In actuator radians, homing offset included - e.g. -pi + homing_offset for a motor that
-   * reports a signed single turn, homing_offset for one that reports an unsigned one.
+   * A window narrower than 2pi admits at most one of the candidate shifts, one of 3pi at most two.
+   * The caller decides how tightly it can bound the interval; anything under 4pi rejects some
+   * candidate and is worth setting.
    */
-  void setResetWindow( double lower_bound ) { reset_window_lower_ = lower_bound; }
-  const std::optional<double> &resetWindowLowerBound() const { return reset_window_lower_; }
+  void setResetWindow( double lower, double upper )
+  {
+    reset_window_ = std::make_pair( lower, upper );
+  }
+  const std::optional<std::pair<double, double>> &resetWindow() const { return reset_window_; }
 
   /// Restart the detector from this position: a deliberate offset change is not a jump.
   void rebaseDetector( double actuator_position ) { prev_actuator_position_ = actuator_position; }
@@ -72,7 +76,7 @@ private:
   std::filesystem::path transmission_file_path_;
   double offset_;
   std::optional<double> prev_actuator_position_;
-  std::optional<double> reset_window_lower_;
+  std::optional<std::pair<double, double>> reset_window_;
   int correction_count_{ 0 };
 
   /// The number of turns a power cycle would have shifted the previous reading by, if any.
@@ -199,21 +203,21 @@ inline std::optional<int> JointOffset::turnsOfAReset( double previous, double cu
   if ( n_turns == 0 || std::abs( delta - n_turns * TWO_PI ) >= JUMP_TOLERANCE ) {
     return std::nullopt; // not a whole number of turns apart
   }
-  if ( !reset_window_lower_ ) {
+  if ( !reset_window_ ) {
     return n_turns;
   }
-  // A reset reports the previous position wrapped into the window - that one value, no other.
-  const double wrapped =
-      previous - TWO_PI * std::floor( ( previous - *reset_window_lower_ ) / TWO_PI );
-  if ( std::abs( current - wrapped ) < JUMP_TOLERANCE ) {
+  // current is already a whole number of turns from previous, so the only question left is whether
+  // a power cycle could have put it here. The tolerance is the same slop the delta test above
+  // allowed, carried over so a reading at the edge is not rejected for measurement noise.
+  const auto &[lower, upper] = *reset_window_;
+  if ( current >= lower - JUMP_TOLERANCE && current < upper + JUMP_TOLERANCE ) {
     return n_turns;
   }
   RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                "Actuator of joint '%s' moved %d x 2pi between two readings (%.4f -> %.4f rad) "
                "without landing where a power cycle puts it ([%.4f, %.4f)). Treated as a real "
                "move, not corrected.",
-               joint_name_.c_str(), n_turns, previous, current, *reset_window_lower_,
-               *reset_window_lower_ + TWO_PI );
+               joint_name_.c_str(), n_turns, previous, current, lower, upper );
   return std::nullopt;
 }
 
