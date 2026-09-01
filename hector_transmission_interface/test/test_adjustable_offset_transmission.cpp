@@ -17,22 +17,29 @@ protected:
   std::filesystem::path offset_file_1;
   std::filesystem::path offset_file_2;
 
+  std::string test_home_;
+  const char *original_home_ = nullptr;
+
   void SetUp() override
   {
-    offset_file_1 = std::filesystem::path( std::getenv( "HOME" ) ) /
-                    ".ros/dynamic_offset_transmissions" / ( joint_name + ".txt" );
-    // Clean before each test
-    std::filesystem::remove( offset_file_1 );
-    offset_file_2 = std::filesystem::path( std::getenv( "HOME" ) ) /
-                    ".ros/dynamic_offset_transmissions" / ( secondary_joint_name + ".txt" );
-    // Clean before each test
-    std::filesystem::remove( offset_file_2 );
+    // Offsets are stored under HOME, so without this the suite reads and writes the developer's
+    // own ~/.ros and a leftover file from a real robot session decides what a test sees.
+    char dir_template[] = "/tmp/transmission_test_home_XXXXXX";
+    test_home_ = mkdtemp( dir_template );
+    original_home_ = std::getenv( "HOME" );
+    setenv( "HOME", test_home_.c_str(), 1 );
+
+    offset_file_1 = std::filesystem::path( test_home_ ) / ".ros/dynamic_offset_transmissions" /
+                    ( joint_name + ".txt" );
+    offset_file_2 = std::filesystem::path( test_home_ ) / ".ros/dynamic_offset_transmissions" /
+                    ( secondary_joint_name + ".txt" );
   }
 
   void TearDown() override
   {
-    std::filesystem::remove( offset_file_1 );
-    std::filesystem::remove( offset_file_2 );
+    if ( original_home_ != nullptr )
+      setenv( "HOME", original_home_, 1 );
+    std::filesystem::remove_all( test_home_ );
   }
 
   bool fileContainsValue( double expected, double tolerance = 1e-6 )
@@ -245,9 +252,65 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_NoCorrectionAfterManualA
   // This internally calls actuator_to_joint() and resets prev_actuator_position_
   trans.adjustTransmissionOffset( 5.0 );
 
-  // Now simulate a read with the same actuator position — no jump should be detected
+  // The actuator has to move for there to be anything to detect: reading the same position twice
+  // reports no jump whether or not the adjustment rebased the detector, which is what let this
+  // test pass with the rebase removed.
+  actuator_pos = 1.2;
   trans.actuator_to_joint();
-  EXPECT_EQ( trans.getCorrectionCount(), 0 );
+  EXPECT_EQ( trans.getCorrectionCount(), 0 )
+      << "An ordinary movement after a calibration was mistaken for a jump.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, OffsetFileWithATrailingNewlineIsAccepted )
+{
+  // Every editor and every shell redirection ends a file with a newline. Extraction stops at it
+  // without setting eofbit, so a strict "must be at eof" check throws the offset away and the
+  // joint silently comes up on the one from the URDF instead.
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << "3.14\n";
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 3.14, 1e-9 )
+      << "A file ending in a newline was rejected, so the persisted offset was lost.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, OffsetFileWithTrailingContentIsRejected )
+{
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << "3.14 garbage";
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 1.5, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 1.5, 1e-9 )
+      << "A file carrying more than an offset was read as one anyway.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PersistedOffsetRoundTripsExactly )
+{
+  // The stream default is six significant digits, which loses about 1e-5 rad per cycle on a
+  // multi-turn offset. Saving and loading must not move the joint.
+  const double offset = 4 * M_PI + 0.123456789012345;
+  {
+    double actuator_pos = 0.0;
+    double joint_pos = 0.0;
+    auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+    trans.adjustTransmissionOffset( offset );
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto reloaded = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+  EXPECT_NEAR( reloaded.get_joint_offset(), offset, 1e-12 )
+      << "The offset lost precision on the way to disk and back.";
 }
 
 TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_ConsecutiveJumpsHandledCorrectly )

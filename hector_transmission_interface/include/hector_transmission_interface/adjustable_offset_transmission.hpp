@@ -6,10 +6,13 @@
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
+#include <limits>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
@@ -176,7 +179,15 @@ private:
 inline JointOffset::JointOffset( const std::string &joint_name, double initial_offset )
     : joint_name_( joint_name ), offset_( initial_offset )
 {
-  transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
+  const char *home = std::getenv( "HOME" );
+  if ( home == nullptr ) {
+    // Constructing a path from nullptr is undefined, and a robot brought up by systemd routinely
+    // has no HOME. Refusing here is the only place that can still say why.
+    throw transmission_interface::Exception(
+        "HOME is not set, so the offset of joint '" +
+        joint_name + "' has nowhere to be stored. An offset that cannot be persisted is lost on every restart." );
+  }
+  transmission_file_path_ = std::filesystem::path( home ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
   if ( existsTransmissionOffsetFile() ) {
     loadTransmissionOffset();
@@ -261,7 +272,17 @@ inline void JointOffset::loadTransmissionOffset()
     if ( file.is_open() ) {
       double offset;
       file >> offset;
-      if ( file.fail() || !file.eof() ) {
+      // Extraction stops at the newline without setting eofbit, so requiring eof rejects every
+      // file that ends in one - which is every file written by an editor or by echo. What must be
+      // rejected is trailing content, so the check is for anything that is not whitespace.
+      bool trailing_content = false;
+      for ( char c = 0; file.get( c ); ) {
+        if ( std::isspace( static_cast<unsigned char>( c ) ) == 0 ) {
+          trailing_content = true;
+          break;
+        }
+      }
+      if ( file.bad() || offset != offset || trailing_content || ( file.fail() && !file.eof() ) ) {
         RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                       "Failed to read a valid offset from file: %s",
                       transmission_file_path_.string().c_str() );
@@ -287,7 +308,9 @@ inline void JointOffset::saveTransmissionOffset() const
   std::filesystem::create_directories( transmission_file_path_.parent_path() );
   std::ofstream file( transmission_file_path_ );
   if ( file.is_open() ) {
-    file << offset_;
+    // Enough digits that loading gives back the offset that was saved. The stream default is six
+    // significant digits, which loses roughly 1e-5 rad per save/load cycle on a multi-turn offset.
+    file << std::setprecision( std::numeric_limits<double>::max_digits10 ) << offset_;
     if ( file.fail() ) {
       RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Failed to write offset to file: %s", transmission_file_path_.string().c_str() );
