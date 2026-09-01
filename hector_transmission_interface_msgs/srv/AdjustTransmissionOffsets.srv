@@ -4,5 +4,8 @@ sensor_msgs/JointState external_joint_measurements
 sensor_msgs/JointState original_joint_state
 ---
 float64[] offset_changes
+# The joints offset_changes belongs to, in the same order. A joint whose calibration could not be
+# computed is left out of both, so without these names the changes cannot be attributed.
+string[] joint_names
 bool success
 string message

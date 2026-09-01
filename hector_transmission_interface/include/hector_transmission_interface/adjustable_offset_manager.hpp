@@ -68,17 +68,21 @@ public:
       std::optional<ServiceCallback> post_callback = std::nullopt );
 
   /**
-   * @brief Manage a joint's offset through its state transmission.
+   * @brief Manage a joint's offset through its transmissions.
    *
-   * Ignored unless the transmission is an AdjustableOffsetTransmission. The command transmission
-   * needs no registration: it shares the state transmission's JointOffset.
+   * Ignored unless the state transmission is an AdjustableOffsetTransmission. The command
+   * transmission shares the same JointOffset, but keeps its own joint goal, computed under the
+   * offset that was current when the controller wrote it. Pass it so an adjustment re-derives that
+   * goal; leaving it out means the next write moves the actuator by the offset change.
    * @param name Joint name
    * @param state_tx State transmission
    * @param position_getter Function to get current position
+   * @param command_tx Command transmission, if the joint has one
    */
-  void add_joint_state_interface( const std::string &name,
-                                  std::shared_ptr<transmission_interface::Transmission> state_tx,
-                                  PositionGetter position_getter );
+  void add_joint_state_interface(
+      const std::string &name, std::shared_ptr<transmission_interface::Transmission> state_tx,
+      PositionGetter position_getter,
+      std::shared_ptr<transmission_interface::Transmission> command_tx = nullptr );
 
   void add_managed_joint( const std::string &name, ManagedJoint mj );
 

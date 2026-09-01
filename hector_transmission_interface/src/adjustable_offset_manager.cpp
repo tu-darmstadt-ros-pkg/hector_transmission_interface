@@ -10,16 +10,27 @@ namespace hector_transmission_interface
 class AdjustableTransmissionAdapter : public IAdjustableOffset
 {
 public:
-  explicit AdjustableTransmissionAdapter( std::shared_ptr<AdjustableOffsetTransmission> tx )
-      : tx_( tx )
+  explicit AdjustableTransmissionAdapter( std::shared_ptr<AdjustableOffsetTransmission> state_tx,
+                                          std::shared_ptr<AdjustableOffsetTransmission> command_tx )
+      : state_tx_( std::move( state_tx ) ), command_tx_( std::move( command_tx ) )
   {
   }
 
-  void adjustOffset( double offset ) override { tx_->adjustTransmissionOffset( offset ); }
-  double getOffset() const override { return tx_->get_joint_offset(); }
+  void adjustOffset( double offset ) override
+  {
+    state_tx_->adjustTransmissionOffset( offset );
+    // The two sides share one JointOffset, so the command side already sees the new offset. What
+    // it does not see is its own cached joint goal, which was computed under the old one: mapping
+    // that down again moves the actuator by the offset change. Re-deriving the joint goal from the
+    // actuator goal keeps the actuator where it is.
+    if ( command_tx_ )
+      command_tx_->adjustTransmissionOffset( offset );
+  }
+  double getOffset() const override { return state_tx_->get_joint_offset(); }
 
 private:
-  std::shared_ptr<AdjustableOffsetTransmission> tx_;
+  std::shared_ptr<AdjustableOffsetTransmission> state_tx_;
+  std::shared_ptr<AdjustableOffsetTransmission> command_tx_;
 };
 
 AdjustableOffsetManager::AdjustableOffsetManager(
@@ -38,14 +49,23 @@ AdjustableOffsetManager::AdjustableOffsetManager(
 
 void AdjustableOffsetManager::add_joint_state_interface(
     const std::string &name, std::shared_ptr<transmission_interface::Transmission> state_tx,
-    PositionGetter position_getter )
+    PositionGetter position_getter, std::shared_ptr<transmission_interface::Transmission> command_tx )
 {
   auto adj_state = std::dynamic_pointer_cast<AdjustableOffsetTransmission>( state_tx );
   if ( !adj_state )
     return;
 
-  managed_joints_[name] =
-      ManagedJoint{ std::make_shared<AdjustableTransmissionAdapter>( adj_state ), position_getter };
+  auto adj_command = std::dynamic_pointer_cast<AdjustableOffsetTransmission>( command_tx );
+  if ( command_tx && !adj_command ) {
+    RCLCPP_WARN( node_->get_logger(),
+                 "Joint '%s' has a command transmission that does not carry an adjustable offset. "
+                 "Its goal will be mapped with the new offset after an adjustment, which moves the "
+                 "actuator.",
+                 name.c_str() );
+  }
+
+  managed_joints_[name] = ManagedJoint{
+      std::make_shared<AdjustableTransmissionAdapter>( adj_state, adj_command ), position_getter };
   RCLCPP_INFO( node_->get_logger(), "Managing the offset of joint '%s'.", name.c_str() );
 }
 
@@ -135,15 +155,37 @@ void AdjustableOffsetManager::handle_service(
       internal_pos = mj.position_getter();
 
     double current_offset = mj.handle->getOffset();
+    // Everything the new offset is computed from has to be a number. The fallback baseline is
+    // whatever the hardware last read, which is not a position at all before the first read
+    // succeeds, and an offset derived from one is written to disk and poisons every later reading.
+    if ( !std::isfinite( internal_pos ) || !std::isfinite( current_offset ) ) {
+      RCLCPP_ERROR( node_->get_logger(),
+                    "Joint '%s' has no usable position to calibrate against (baseline %f, current "
+                    "offset %f). Skipping it.",
+                    joint_name.c_str(), internal_pos, current_offset );
+      continue;
+    }
     double corrected_offset =
         request->external_joint_measurements.position[i] - internal_pos + current_offset;
 
     mj.handle->adjustOffset( corrected_offset );
 
     response->offset_changes.push_back( corrected_offset - current_offset );
+    // Named, because the changes are fewer than the request whenever a joint is skipped and
+    // nothing else says which ones they belong to.
+    response->joint_names.push_back( joint_name );
   }
-  response->message = response->offset_changes.empty() ? "No joints adjusted" : "Success";
-  response->success = !response->offset_changes.empty();
+  const bool all_adjusted = response->offset_changes.size() == num_measurements;
+  response->success = all_adjusted;
+  if ( all_adjusted ) {
+    response->message = "Success";
+  } else if ( response->offset_changes.empty() ) {
+    response->message = "No joints adjusted";
+  } else {
+    response->message = "Adjusted " + std::to_string( response->offset_changes.size() ) + " of " +
+                        std::to_string( num_measurements ) +
+                        " joints; joint_names lists the ones that changed";
+  }
 
   // --- POST CALLBACK ---
   if ( post_callback_locked_.has_value() ) {

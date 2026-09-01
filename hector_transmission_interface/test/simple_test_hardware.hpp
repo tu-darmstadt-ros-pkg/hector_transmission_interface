@@ -104,8 +104,11 @@ public:
 
       // 4. Register State Interface with Offset Manager
       // The position_getter lambda provides the current *internal (raw)* position to the manager.
-      offset_manager_->add_joint_state_interface( name, joint.state_transmission,
-                                                  [&joint]() { return joint.joint_position; } );
+      // The command transmission goes in as well: its joint goal was computed under the old
+      // offset, and mapping it down again after an adjustment moves the actuator.
+      offset_manager_->add_joint_state_interface(
+          name, joint.state_transmission, [&joint]() { return joint.joint_position; },
+          joint.command_transmission );
     }
 
     return state_interfaces;
@@ -205,6 +208,26 @@ public:
       }
     }
   }
+
+  /// @brief The goal a controller would write, in joint coordinates.
+  void set_joint_command( const std::string &joint_name, double val )
+  {
+    if ( joints_.count( joint_name ) ) {
+      joints_[joint_name].joint_command = val;
+    }
+  }
+
+  /// @brief What the last write() put on the actuator. This is what the motor is told to do.
+  double get_actuator_command( const std::string &joint_name )
+  {
+    if ( joints_.count( joint_name ) ) {
+      return joints_[joint_name].actuator_command;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  /// @brief Manually trigger the write cycle logic for testing.
+  void propagate_write() { write( rclcpp::Time(), rclcpp::Duration( 0, 0 ) ); }
 
 private:
 public: // Made public struct for simplicity in this single-header test file
