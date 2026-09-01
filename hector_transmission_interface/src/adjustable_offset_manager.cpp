@@ -64,13 +64,17 @@ void AdjustableOffsetManager::add_joint_state_interface(
                  name.c_str() );
   }
 
-  managed_joints_[name] = ManagedJoint{
-      std::make_shared<AdjustableTransmissionAdapter>( adj_state, adj_command ), position_getter };
+  {
+    std::lock_guard<std::mutex> lock( managed_joints_mutex_ );
+    managed_joints_[name] = ManagedJoint{
+        std::make_shared<AdjustableTransmissionAdapter>( adj_state, adj_command ), position_getter };
+  }
   RCLCPP_INFO( node_->get_logger(), "Managing the offset of joint '%s'.", name.c_str() );
 }
 
 void AdjustableOffsetManager::add_managed_joint( const std::string &name, ManagedJoint mj )
 {
+  std::lock_guard<std::mutex> lock( managed_joints_mutex_ );
   managed_joints_[name] = mj;
 }
 
@@ -92,6 +96,8 @@ void AdjustableOffsetManager::handle_service(
   // --- THREAD SAFETY ---
   // Held for the rest of this function, including the post-callback and every position_getter call.
   const OptionalCommLock lock( comm_mutex_ );
+  // Separate from the hardware mutex, which does not cover the registration map.
+  std::lock_guard<std::mutex> joints_lock( managed_joints_mutex_ );
 
   response->success = false;
 
@@ -212,6 +218,8 @@ void AdjustableOffsetManager::handle_flip_by_pi(
   // --- THREAD SAFETY ---
   // Held for the rest of this function, including the post-callback.
   const OptionalCommLock lock( comm_mutex_ );
+  // Separate from the hardware mutex, which does not cover the registration map.
+  std::lock_guard<std::mutex> joints_lock( managed_joints_mutex_ );
 
   size_t flipped_count = 0;
 

@@ -109,6 +109,11 @@ private:
   /// must not take that mutex again or call anything that does. Same rule for
   /// ManagedJoint::position_getter, which is invoked from inside the same critical section.
   std::optional<ServiceCallback> post_callback_locked_;
+  /// Registration runs on the controller manager's thread while the services are already up, so a
+  /// call landing during a re-export would iterate a map being inserted into. The hardware mutex
+  /// does not cover this: it serialises the handlers against read and write, not against
+  /// registration.
+  mutable std::mutex managed_joints_mutex_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::FlipByPi>::SharedPtr flip_by_pi_service_;

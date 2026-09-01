@@ -60,6 +60,13 @@ public:
    */
   void setResetWindow( double lower, double upper )
   {
+    if ( !( lower < upper ) ) {
+      // An empty window admits no candidate, so every correction is silently dropped while the
+      // detector goes on warning about each jump it found and could not act on.
+      throw transmission_interface::Exception(
+          "The boot position window of joint '" + joint_name_ + "' is empty (lower " +
+          std::to_string( lower ) + " is not below upper " + std::to_string( upper ) + ")." );
+    }
     reset_window_ = std::make_pair( lower, upper );
   }
   const std::optional<std::pair<double, double>> &resetWindow() const { return reset_window_; }
