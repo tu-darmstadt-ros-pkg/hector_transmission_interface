@@ -252,10 +252,19 @@ TEST_F( AdjustableOffsetManagerTest, HandlingNaNValues )
 /**
  * Test: Mismatched Array Sizes
  * Scenario: User sends 2 names but only 1 position.
- * This tests the robustness of the loop indices.
+ * A JointState whose arrays disagree cannot attribute its positions to names, so the request is
+ * refused whole rather than calibrated against whichever entries happen to line up.
  */
 TEST_F( AdjustableOffsetManagerTest, MismatchedArraySizes )
 {
+  auto mock_state = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 0 );
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock_state;
+  mj.position_getter = []() { return 0.0; };
+  manager_->add_managed_joint( "j1", mj );
+
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   auto request_header = std::make_shared<rmw_request_id_t>();
@@ -264,9 +273,44 @@ TEST_F( AdjustableOffsetManagerTest, MismatchedArraySizes )
   request->external_joint_measurements.name = { "j1", "j2" };
   request->external_joint_measurements.position = { 1.0 }; // Only one!
 
-  // Manager should handle this without out_of_bounds exception
-  // Usually by iterating based on the smaller of the two sizes or the name size with a check.
-  EXPECT_CALL( *service, send_response( *request_header, testing::_ ) ).Times( 1 );
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) )
+      .Times( 1 );
+
+  service->handle_request( request_header, request );
+}
+
+/**
+ * Test: Mismatched original_joint_state Array Sizes
+ * Scenario: The optional baseline carries names but no positions.
+ * The baseline lookup walks the name array, so a shorter position array is read past its end: an
+ * out-of-bounds double becomes the calibration baseline and is persisted as an offset.
+ */
+TEST_F( AdjustableOffsetManagerTest, MismatchedOriginalJointStateArraySizes )
+{
+  auto mock_state = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 0 );
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock_state;
+  mj.position_getter = []() { return 0.0; };
+  manager_->add_managed_joint( "j1", mj );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+
+  request->external_joint_measurements.name = { "j1" };
+  request->external_joint_measurements.position = { 1.0 };
+  request->original_joint_state.name = { "j1" };
+  request->original_joint_state.position = {}; // names without the positions they name
+
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) )
+      .Times( 1 );
 
   service->handle_request( request_header, request );
 }

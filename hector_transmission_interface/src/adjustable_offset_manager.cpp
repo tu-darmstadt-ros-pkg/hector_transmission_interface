@@ -75,8 +75,28 @@ void AdjustableOffsetManager::handle_service(
 
   response->success = false;
 
-  size_t num_measurements = std::min( request->external_joint_measurements.name.size(),
-                                      request->external_joint_measurements.position.size() );
+  // A JointState whose name and position arrays disagree carries no usable measurement: the
+  // positions cannot be attributed to names. Truncating to the shorter one calibrates against
+  // whatever happens to line up, so a malformed request is refused whole.
+  if ( request->external_joint_measurements.name.size() !=
+       request->external_joint_measurements.position.size() ) {
+    response->message =
+        "external_joint_measurements has " +
+        std::to_string( request->external_joint_measurements.name.size() ) + " names but " +
+        std::to_string( request->external_joint_measurements.position.size() ) + " positions";
+    RCLCPP_ERROR( node_->get_logger(), "Refusing offset adjustment: %s", response->message.c_str() );
+    return;
+  }
+  if ( request->original_joint_state.name.size() != request->original_joint_state.position.size() ) {
+    response->message =
+        "original_joint_state has " + std::to_string( request->original_joint_state.name.size() ) +
+        " names but " + std::to_string( request->original_joint_state.position.size() ) +
+        " positions";
+    RCLCPP_ERROR( node_->get_logger(), "Refusing offset adjustment: %s", response->message.c_str() );
+    return;
+  }
+
+  const size_t num_measurements = request->external_joint_measurements.name.size();
 
   for ( size_t i = 0; i < num_measurements; ++i ) {
     const std::string &joint_name = request->external_joint_measurements.name[i];
