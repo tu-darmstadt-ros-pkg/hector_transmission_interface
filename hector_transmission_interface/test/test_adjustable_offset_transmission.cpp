@@ -294,6 +294,71 @@ TEST_F( AdjustableOffsetTransmissionTest, OffsetFileWithTrailingContentIsRejecte
       << "A file carrying more than an offset was read as one anyway.";
 }
 
+// A crash between truncating the offset file and writing it leaves one of these behind. Reading any
+// of them as an offset moves the joint by whole turns on the next boot, and the jump detector then
+// persists what it read.
+class TruncatedOffsetFileTest : public AdjustableOffsetTransmissionTest,
+                                public ::testing::WithParamInterface<std::string>
+{
+};
+
+TEST_P( TruncatedOffsetFileTest, TheConfiguredOffsetSurvivesAnUnreadableFile )
+{
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << GetParam();
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 1.5, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 1.5, 1e-9 )
+      << "A file holding '" << GetParam() << "' was accepted as an offset.";
+}
+
+// "1e400" is the one that overflows rather than truncates: extraction clamps it to DBL_MAX and
+// reports the failure, so a check that does not look at failbit adopts a huge offset.
+INSTANTIATE_TEST_SUITE_P( CrashLeftovers, TruncatedOffsetFileTest,
+                          ::testing::Values( "", "\n\n", "   ", "-", "1.23e", "1e400" ) );
+
+TEST_F( AdjustableOffsetTransmissionTest, AFailedSaveLeavesThePreviousOffsetOnDisk )
+{
+  {
+    AdjustableOffsetTransmission trans( joint_name, 1.0, 0.25 );
+    ASSERT_TRUE( fileContainsValue( 0.25 ) );
+  }
+
+  // A directory where the file belongs: every open for writing fails, the way a full or read-only
+  // disk fails, without needing one.
+  std::filesystem::path blocker = offset_file_1;
+  blocker += ".tmp";
+  std::filesystem::create_directories( blocker );
+
+  AdjustableOffsetTransmission trans( joint_name, 1.0 );
+  trans.adjustTransmissionOffset( 9.75 );
+
+  EXPECT_TRUE( fileContainsValue( 0.25 ) )
+      << "A save that could not be written destroyed the offset that was already on disk.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, ANonFiniteReadingIsNotTakenForAJump )
+{
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  const double reduction = 2.0;
+
+  ASSERT_EQ( offset->observeActuatorPosition( 0.4, reduction ), 0 );
+  EXPECT_EQ( offset->observeActuatorPosition( std::numeric_limits<double>::quiet_NaN(), reduction ),
+             0 );
+  EXPECT_EQ( offset->correctionCount(), 0 );
+  EXPECT_NEAR( offset->value(), 0.0, 1e-9 )
+      << "A NaN reading was rounded to a turn count and absorbed into the offset.";
+
+  // The reading after it is measured against the last real position, not against the NaN.
+  EXPECT_EQ( offset->observeActuatorPosition( 0.4 + 2 * M_PI, reduction ), 1 );
+  EXPECT_NEAR( offset->value(), -2 * M_PI / reduction, 1e-9 );
+}
+
 TEST_F( AdjustableOffsetTransmissionTest, PersistedOffsetRoundTripsExactly )
 {
   // The stream default is six significant digits, which loses about 1e-5 rad per cycle on a

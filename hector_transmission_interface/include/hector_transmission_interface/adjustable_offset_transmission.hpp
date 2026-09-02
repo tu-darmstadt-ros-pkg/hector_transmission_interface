@@ -72,7 +72,13 @@ public:
   const std::optional<std::pair<double, double>> &resetWindow() const { return reset_window_; }
 
   /// Restart the detector from this position: a deliberate offset change is not a jump.
-  void rebaseDetector( double actuator_position ) { prev_actuator_position_ = actuator_position; }
+  /// A non-finite position is not recorded, keeping the baseline finite for the jump arithmetic.
+  void rebaseDetector( double actuator_position )
+  {
+    if ( std::isfinite( actuator_position ) ) {
+      prev_actuator_position_ = actuator_position;
+    }
+  }
 
   int correctionCount() const { return correction_count_; }
   const std::string &jointName() const { return joint_name_; }
@@ -95,6 +101,8 @@ private:
   static constexpr double TWO_PI = 2.0 * M_PI;
   // Tolerance for detecting a 2pi jump (allow ~10% margin)
   static constexpr double JUMP_TOLERANCE = 0.2 * M_PI;
+  /// Largest turn count a power cycle can plausibly shift a reading by.
+  static constexpr double MAX_RESET_TURNS = 1e6;
 };
 
 class AdjustableOffsetTransmission : public transmission_interface::SimpleTransmission
@@ -210,6 +218,12 @@ inline JointOffset::JointOffset( const std::string &joint_name, double initial_o
 
 inline void JointOffset::set( double offset )
 {
+  if ( !std::isfinite( offset ) ) {
+    // Every joint position is computed from this, and it would be persisted for the next boot too.
+    RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                  "Refusing a non-finite offset for joint '%s'.", joint_name_.c_str() );
+    return;
+  }
   offset_ = offset;
   saveTransmissionOffset();
 }
@@ -217,7 +231,13 @@ inline void JointOffset::set( double offset )
 inline std::optional<int> JointOffset::turnsOfAReset( double previous, double current ) const
 {
   const double delta = current - previous;
-  const int n_turns = static_cast<int>( std::round( delta / TWO_PI ) );
+  const double turns = std::round( delta / TWO_PI );
+  // A turn count that does not fit an int is undefined to convert, and no actuator reset is that
+  // far away. MAX_RESET_TURNS is far above any real one and far below where the cast breaks.
+  if ( std::abs( turns ) > MAX_RESET_TURNS ) {
+    return std::nullopt;
+  }
+  const int n_turns = static_cast<int>( turns );
   if ( n_turns == 0 || std::abs( delta - n_turns * TWO_PI ) >= JUMP_TOLERANCE ) {
     return std::nullopt; // not a whole number of turns apart
   }
@@ -247,6 +267,13 @@ inline std::optional<int> JointOffset::turnsOfAReset( double previous, double cu
 
 inline int JointOffset::observeActuatorPosition( double actuator_position, double reduction )
 {
+  if ( !std::isfinite( actuator_position ) || !std::isfinite( reduction ) || reduction == 0.0 ) {
+    // Rounding a non-finite delta to a turn count is undefined, and the jump test cannot reject it
+    // either: every comparison against NaN is false. A reduction that is not a real number turns
+    // any correction it does compute into a non-finite offset. Nothing is recorded, so the next
+    // real reading becomes the baseline.
+    return 0;
+  }
   int n_jumps = 0;
   if ( prev_actuator_position_.has_value() ) {
     if ( const auto turns = turnsOfAReset( *prev_actuator_position_, actuator_position ) ) {
@@ -273,60 +300,88 @@ inline bool JointOffset::existsTransmissionOffsetFile() const
 
 inline void JointOffset::loadTransmissionOffset()
 {
-  // Load the transmission offset from the specified storage path
-  if ( std::filesystem::exists( transmission_file_path_ ) ) {
-    std::ifstream file( transmission_file_path_ );
-    if ( file.is_open() ) {
-      double offset;
-      file >> offset;
-      // Extraction stops at the newline without setting eofbit, so requiring eof rejects every
-      // file that ends in one - which is every file written by an editor or by echo. What must be
-      // rejected is trailing content, so the check is for anything that is not whitespace.
-      bool trailing_content = false;
-      for ( char c = 0; file.get( c ); ) {
-        if ( std::isspace( static_cast<unsigned char>( c ) ) == 0 ) {
-          trailing_content = true;
-          break;
-        }
-      }
-      if ( file.bad() || offset != offset || trailing_content || ( file.fail() && !file.eof() ) ) {
-        RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                      "Failed to read a valid offset from file: %s",
-                      transmission_file_path_.string().c_str() );
-      } else {
-        offset_ = offset;
-      }
-      file.close();
-    } else {
-      RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                    "Failed to open transmission offset file: %s",
-                    transmission_file_path_.string().c_str() );
-    }
-  } else {
-    RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                 "Transmission offset file does not exist: %s",
+  const auto logger = rclcpp::get_logger( "AdjustableOffsetTransmission" );
+  if ( !std::filesystem::exists( transmission_file_path_ ) ) {
+    RCLCPP_WARN( logger, "Transmission offset file does not exist: %s",
                  transmission_file_path_.string().c_str() );
+    return;
   }
+  std::ifstream file( transmission_file_path_ );
+  if ( !file.is_open() ) {
+    RCLCPP_ERROR( logger, "Failed to open transmission offset file: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+
+  double offset;
+  file >> offset;
+  // Tested before the scan below, which drives the stream to eof: an extraction that failed on a
+  // truncated or empty file also ends there, so failbit only tells the two apart now.
+  if ( file.fail() ) {
+    RCLCPP_ERROR( logger, "Transmission offset file holds no number: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+  // Extraction stops at the newline without setting eofbit, so requiring eof rejects every file
+  // that ends in one - which is every file written by an editor or by echo. What must be rejected
+  // is trailing content, so the check is for anything that is not whitespace.
+  bool trailing_content = false;
+  for ( char c = 0; file.get( c ); ) {
+    if ( std::isspace( static_cast<unsigned char>( c ) ) == 0 ) {
+      trailing_content = true;
+      break;
+    }
+  }
+  if ( file.bad() || trailing_content || !std::isfinite( offset ) ) {
+    RCLCPP_ERROR( logger, "Failed to read a valid offset from file: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+  offset_ = offset;
 }
 
 inline void JointOffset::saveTransmissionOffset() const
 {
-  // Save the current transmission offset to the specified storage path
-  std::filesystem::create_directories( transmission_file_path_.parent_path() );
-  std::ofstream file( transmission_file_path_ );
-  if ( file.is_open() ) {
+  const auto logger = rclcpp::get_logger( "AdjustableOffsetTransmission" );
+  std::error_code error;
+  std::filesystem::create_directories( transmission_file_path_.parent_path(), error );
+  if ( error ) {
+    // Reported rather than thrown: this runs from the control loop and from service callbacks,
+    // and an exception out of either takes the process with it.
+    RCLCPP_ERROR( logger, "Failed to create the directory for %s: %s",
+                  transmission_file_path_.string().c_str(), error.message().c_str() );
+    return;
+  }
+
+  // Written beside the target and renamed onto it. A crash or a full disk partway through leaves
+  // the previous offset in place instead of the empty or half-written file that a direct write
+  // would leave, which the loader cannot tell from a good one.
+  std::filesystem::path temp_path = transmission_file_path_;
+  temp_path += ".tmp";
+  {
+    std::ofstream file( temp_path );
+    if ( !file.is_open() ) {
+      RCLCPP_ERROR( logger, "Failed to open transmission offset file for writing: %s",
+                    temp_path.string().c_str() );
+      return;
+    }
     // Enough digits that loading gives back the offset that was saved. The stream default is six
     // significant digits, which loses roughly 1e-5 rad per save/load cycle on a multi-turn offset.
     file << std::setprecision( std::numeric_limits<double>::max_digits10 ) << offset_;
-    if ( file.fail() ) {
-      RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                    "Failed to write offset to file: %s", transmission_file_path_.string().c_str() );
-    }
     file.close();
-  } else {
-    RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                  "Failed to open transmission offset file for writing: %s",
-                  transmission_file_path_.string().c_str() );
+    // After close(), which is where a deferred flush failure (a full disk) surfaces.
+    if ( file.fail() ) {
+      RCLCPP_ERROR( logger, "Failed to write offset to file: %s", temp_path.string().c_str() );
+      std::filesystem::remove( temp_path, error );
+      return;
+    }
+  }
+
+  std::filesystem::rename( temp_path, transmission_file_path_, error );
+  if ( error ) {
+    RCLCPP_ERROR( logger, "Failed to move the new offset onto %s: %s",
+                  transmission_file_path_.string().c_str(), error.message().c_str() );
+    std::filesystem::remove( temp_path, error );
   }
 }
 
