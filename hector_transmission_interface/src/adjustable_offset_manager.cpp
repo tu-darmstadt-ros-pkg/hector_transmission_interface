@@ -1,6 +1,7 @@
 #include "hector_transmission_interface/adjustable_offset_manager.hpp"
 
 #include <cmath>
+#include <set>
 
 namespace hector_transmission_interface
 {
@@ -151,7 +152,7 @@ void AdjustableOffsetManager::handle_service(
       for ( size_t j = 0; j < request->original_joint_state.name.size(); ++j ) {
         if ( request->original_joint_state.name[j] == joint_name ) {
           internal_pos = request->original_joint_state.position[j];
-          found_internal = std::isfinite( internal_pos );
+          found_internal = true;
           break;
         }
       }
@@ -181,9 +182,14 @@ void AdjustableOffsetManager::handle_service(
     // nothing else says which ones they belong to.
     response->joint_names.push_back( joint_name );
   }
-  const bool all_adjusted = response->offset_changes.size() == num_measurements;
+  // An empty request adjusted everything it was asked to, which is nothing. Answering success for
+  // that tells a calibration client its measurements were applied when it supplied none.
+  const bool all_adjusted =
+      num_measurements > 0 && response->offset_changes.size() == num_measurements;
   response->success = all_adjusted;
-  if ( all_adjusted ) {
+  if ( num_measurements == 0 ) {
+    response->message = "No joints were requested";
+  } else if ( all_adjusted ) {
     response->message = "Success";
   } else if ( response->offset_changes.empty() ) {
     response->message = "No joints adjusted";
@@ -223,7 +229,10 @@ void AdjustableOffsetManager::handle_flip_by_pi(
 
   size_t flipped_count = 0;
 
-  for ( const auto &joint_name : request->joint_names ) {
+  // A name repeated in one request would otherwise be flipped twice, which is a full turn of the
+  // joint rather than a half one.
+  const std::set<std::string> requested( request->joint_names.begin(), request->joint_names.end() );
+  for ( const auto &joint_name : requested ) {
     auto it = managed_joints_.find( joint_name );
     if ( it == managed_joints_.end() ) {
       RCLCPP_WARN( node_->get_logger(), "Joint '%s' not found, skipping.", joint_name.c_str() );
@@ -243,10 +252,11 @@ void AdjustableOffsetManager::handle_flip_by_pi(
     ++flipped_count;
   }
 
-  response->success = flipped_count > 0;
-  response->message = flipped_count > 0
-                          ? "Flipped " + std::to_string( flipped_count ) + " joint(s) by pi"
-                          : "No joints flipped";
+  // Every named joint, not just one of them: a half-flipped pair leaves the robot in a pose
+  // nobody asked for, and the response has no room to say which half.
+  response->success = !requested.empty() && flipped_count == requested.size();
+  response->message = "Flipped " + std::to_string( flipped_count ) + " of " +
+                      std::to_string( requested.size() ) + " requested joint(s) by pi";
 
   // --- POST CALLBACK ---
   if ( post_callback_locked_.has_value() ) {

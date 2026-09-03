@@ -250,6 +250,55 @@ TEST_F( AdjustableOffsetManagerTest, HandlingNaNValues )
 }
 
 /**
+ * Test: A baseline the caller supplied but that is not a number.
+ * Falling back to the live position calibrates against a pose the measurement was not taken in.
+ */
+TEST_F( AdjustableOffsetManagerTest, NonFiniteSuppliedBaselineIsRefused )
+{
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock;
+  // The joint itself is readable. The caller's own baseline is not.
+  mj.position_getter = []() { return 0.5; };
+  manager_->add_managed_joint( "unread_joint", mj );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "unread_joint" };
+  request->external_joint_measurements.position = { 1.0 };
+  // Saying "the measurement was taken at this pose" and giving a value that is not one. Silently
+  // substituting where the joint is now calibrates against a different pose.
+  request->original_joint_state.name = { "unread_joint" };
+  request->original_joint_state.position = { std::numeric_limits<double>::quiet_NaN() };
+
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 0 );
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
+ * Test: An empty request adjusted nothing, so it did not succeed.
+ */
+TEST_F( AdjustableOffsetManagerTest, EmptyRequestIsNotASuccess )
+{
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
  * Test: Mismatched Array Sizes
  * Scenario: User sends 2 names but only 1 position.
  * A JointState whose arrays disagree cannot attribute its positions to names, so the request is
