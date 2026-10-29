@@ -33,9 +33,10 @@ public:
   // Convenience constructor for single joint
   explicit SimpleTestHardware( const std::string &joint_name ) : joint_names_( { joint_name } ) { }
 
-  hardware_interface::CallbackReturn on_init( const hardware_interface::HardwareInfo &info ) override
+  hardware_interface::CallbackReturn
+  on_init( const hardware_interface::HardwareComponentInterfaceParams &params ) override
   {
-    if ( hardware_interface::SystemInterface::on_init( info ) !=
+    if ( hardware_interface::SystemInterface::on_init( params ) !=
          hardware_interface::CallbackReturn::SUCCESS ) {
       return hardware_interface::CallbackReturn::ERROR;
     }

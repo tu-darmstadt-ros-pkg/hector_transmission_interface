@@ -6,7 +6,7 @@ repositories:
   rtest:
     type: git
     url: https://github.com/tu-darmstadt-ros-pkg/rtest.git
-    version: jazzy
+    version: lyrical
   hector_testing_utils:
     type: git
     url: https://github.com/Joschi3/hector_testing_utils.git
