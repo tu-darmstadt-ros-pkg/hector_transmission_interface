@@ -9,6 +9,13 @@ export_windows_symbols()
 set(THIS_PACKAGE_INCLUDE_DEPENDS
     pluginlib rclcpp transmission_interface controller_manager_msgs
     hector_transmission_interface_msgs sensor_msgs)
+set(THIS_PACKAGE_INCLUDE_DEPENDS_TARGETS
+    pluginlib::pluginlib
+    rclcpp::rclcpp
+    transmission_interface::transmission_interface
+    controller_manager_msgs::controller_manager_msgs
+    hector_transmission_interface_msgs::hector_transmission_interface_msgs
+    sensor_msgs::sensor_msgs)
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_gen_version_h REQUIRED)
@@ -24,7 +31,7 @@ target_include_directories(
   ${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
                          $<INSTALL_INTERFACE:include>)
 
-ament_target_dependencies(${PROJECT_NAME} ${THIS_PACKAGE_INCLUDE_DEPENDS})
+target_link_libraries(${PROJECT_NAME} ${THIS_PACKAGE_INCLUDE_DEPENDS_TARGETS})
 
 # Pluginlib Export
 pluginlib_export_plugin_description_file(${PROJECT_NAME}
@@ -40,10 +47,9 @@ if(BUILD_TESTING)
   # 1. Add the original transmission test (GTest)
   ament_add_gtest(test_adjustable_offset_transmission
                   test/test_adjustable_offset_transmission.cpp)
-  target_link_libraries(test_adjustable_offset_transmission ${PROJECT_NAME}
-                        ${rclcpp_LIBRARIES})
-  ament_target_dependencies(test_adjustable_offset_transmission rclcpp
-                            transmission_interface)
+  target_link_libraries(
+    test_adjustable_offset_transmission ${PROJECT_NAME} rclcpp::rclcpp
+    transmission_interface::transmission_interface)
 
   # 1. Add the Manager test (GMock + rtest) NOTE: Added test/main.cpp which is
   #   required for initializing ROS2/GTest context
@@ -62,24 +68,23 @@ if(BUILD_TESTING)
     rtest::service_mock
     rtest::service_client_mock
     rtest::action_server_mock
-    rtest::action_client_mock)
-
-  # ament_target_dependencies handles the "rtest" target/include resolution
-  # correctly
-  ament_target_dependencies(test_adjustable_offset_manager
-                            ${THIS_PACKAGE_INCLUDE_DEPENDS})
+    rtest::action_client_mock
+    ${THIS_PACKAGE_INCLUDE_DEPENDS_TARGETS})
 
   target_include_directories(test_adjustable_offset_manager
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+  find_package(hardware_interface REQUIRED)
   find_package(hector_testing_utils REQUIRED)
   ament_add_gtest(test_offset_manager_integration
                   test/test_offset_manager_integration.cpp)
   target_link_libraries(
-    test_offset_manager_integration ${PROJECT_NAME} ${rclcpp_LIBRARIES}
+    test_offset_manager_integration
+    ${PROJECT_NAME}
+    rclcpp::rclcpp
+    hardware_interface::hardware_interface
+    transmission_interface::transmission_interface
     hector_testing_utils::hector_testing_utils)
-  ament_target_dependencies(test_offset_manager_integration rclcpp
-                            hardware_interface transmission_interface)
   target_include_directories(test_offset_manager_integration
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endif()

@@ -30,8 +30,8 @@ protected:
     hardware_ = std::make_shared<SimpleTestHardware>( joint_names_ );
 
     // Initialize Hardware
-    hardware_interface::HardwareInfo info; // Dummy info
-    hardware_->on_init( info );
+    hardware_interface::HardwareComponentInterfaceParams params; // Dummy params
+    hardware_->on_init( params );
     hardware_->on_configure( rclcpp_lifecycle::State() );
     hardware_->on_activate( rclcpp_lifecycle::State() );
     hardware_->on_export_state_interfaces();
@@ -107,8 +107,8 @@ TEST_F( OffsetManagerIntegrationTest, PersistenceAcrossRestarts )
 
   // 2. Re-initialize hardware (fresh instance)
   auto fresh_hardware = std::make_shared<SimpleTestHardware>( j );
-  hardware_interface::HardwareInfo info;
-  fresh_hardware->on_init( info );
+  hardware_interface::HardwareComponentInterfaceParams params;
+  fresh_hardware->on_init( params );
 
   // 3. Verify it used the offset
   // Raw=1.0 + Offset=3.14 -> Joint=4.14
