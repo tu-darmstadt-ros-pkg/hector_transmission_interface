@@ -57,7 +57,8 @@ if(BUILD_TESTING)
   # 1b. The exported plugin description must actually resolve through pluginlib.
   ament_add_gtest(test_plugin_export test/test_plugin_export.cpp)
   target_link_libraries(test_plugin_export ${PROJECT_NAME})
-  ament_target_dependencies(test_plugin_export pluginlib transmission_interface)
+  target_link_libraries(test_plugin_export pluginlib::pluginlib
+                        transmission_interface::transmission_interface)
 
   # 1. Add the Manager test (GMock + rtest) NOTE: Added test/main.cpp which is
   #   required for initializing ROS2/GTest context
