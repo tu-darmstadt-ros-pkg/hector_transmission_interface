@@ -83,9 +83,10 @@ public:
     std::vector<hardware_interface::StateInterface::ConstSharedPtr> state_interfaces;
 
     for ( auto &[name, joint] : joints_ ) {
-      // Export the "Joint State" (what ROS sees)
+      // The tests drive this hardware through its helpers, never through a controller, so the
+      // exported handles only complete the interface.
       state_interfaces.emplace_back( std::make_shared<hardware_interface::StateInterface>(
-          name, hardware_interface::HW_IF_POSITION, &joint.joint_position ) );
+          name, hardware_interface::HW_IF_POSITION ) );
 
       // Configure Transmission Handles
       std::vector<transmission_interface::JointHandle> joint_handles;
@@ -119,9 +120,9 @@ public:
     std::vector<hardware_interface::CommandInterface::SharedPtr> command_interfaces;
 
     for ( auto &[name, joint] : joints_ ) {
-      // Export "Joint Command" (what ROS controllers write to)
+      // Only completes the interface, see on_export_state_interfaces
       command_interfaces.emplace_back( std::make_shared<hardware_interface::CommandInterface>(
-          name, hardware_interface::HW_IF_POSITION, &joint.joint_command ) );
+          name, hardware_interface::HW_IF_POSITION ) );
 
       // Configure Transmission Handles
       std::vector<transmission_interface::JointHandle> joint_handles;
