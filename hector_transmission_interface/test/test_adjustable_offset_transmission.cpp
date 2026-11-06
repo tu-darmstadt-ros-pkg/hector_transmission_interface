@@ -3,9 +3,11 @@
 //
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <hector_transmission_interface/adjustable_offset_transmission.hpp>
+#include <sys/stat.h>
 
 using namespace hector_transmission_interface;
 
@@ -87,6 +89,7 @@ TEST_F( AdjustableOffsetTransmissionTest, LoadAndSaveOffset )
   // 2) Adjust offset and check file was updated
   trans.adjustTransmissionOffset( 0.456 );
   EXPECT_NEAR( trans.get_joint_offset(), 0.456, 1e-9 );
+  trans.jointOffset()->flush();
   EXPECT_TRUE( fileContainsValue( 0.456 ) );
 
   // 3) Reload new instance from file, check offset persists
@@ -219,6 +222,7 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_OffsetPersistedToDisk )
   EXPECT_NEAR( trans.get_joint_offset(), expected_offset, 1e-9 );
 
   // Verify persistence: reload from file
+  trans.jointOffset()->flush();
   AdjustableOffsetTransmission trans2( joint_name, 2.0, 0.0 );
   EXPECT_NEAR( trans2.get_joint_offset(), expected_offset, 1e-4 );
 }
@@ -337,9 +341,33 @@ TEST_F( AdjustableOffsetTransmissionTest, AFailedSaveLeavesThePreviousOffsetOnDi
 
   AdjustableOffsetTransmission trans( joint_name, 1.0 );
   trans.adjustTransmissionOffset( 9.75 );
+  trans.jointOffset()->flush();
 
   EXPECT_TRUE( fileContainsValue( 0.25 ) )
       << "A save that could not be written destroyed the offset that was already on disk.";
+}
+
+// A 2pi correction happens in the control loop, which must not wait for a disk. The save path is
+// made to block, with a FIFO where the temporary file goes, and the correction must return anyway.
+TEST_F( AdjustableOffsetTransmissionTest, ACorrectionDoesNotWaitForTheDisk )
+{
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  std::filesystem::path fifo = offset_file_1;
+  fifo += ".tmp";
+  ASSERT_EQ( mkfifo( fifo.c_str(), 0600 ), 0 );
+
+  ASSERT_EQ( offset->observeActuatorPosition( 0.4, 1.0 ), 0 );
+  auto correction = std::async( std::launch::async, [&offset] {
+    return offset->observeActuatorPosition( 0.4 + 2 * M_PI, 1.0 );
+  } );
+  const bool returned = correction.wait_for( std::chrono::seconds( 2 ) ) == std::future_status::ready;
+
+  // Unblock the writer, so the offset and the test can end either way
+  std::ifstream reader( fifo );
+  std::string ignored;
+  reader >> ignored;
+  ASSERT_TRUE( returned ) << "the correction waited for the offset file to be written";
+  EXPECT_EQ( correction.get(), 1 );
 }
 
 TEST_F( AdjustableOffsetTransmissionTest, ANonFiniteReadingIsNotTakenForAJump )
@@ -697,6 +725,7 @@ TEST_F( AdjustableOffsetTransmissionTest, AdjustingEitherSideMovesBoth )
   EXPECT_DOUBLE_EQ( state.get_joint_offset(), -0.5 );
   state.actuator_to_joint();
   EXPECT_NEAR( joint_pos, 0.5, 1e-9 );
+  offset->flush();
   EXPECT_TRUE( fileContainsValue( -0.5 ) );
 }
 

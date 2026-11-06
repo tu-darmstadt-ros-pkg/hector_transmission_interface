@@ -6,16 +6,21 @@
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
+#include <thread>
 #include <transmission_interface/simple_transmission.hpp>
 #include <utility>
 #include <vector>
@@ -27,12 +32,19 @@ namespace hector_transmission_interface
  *
  * A joint is served by two transmissions - one bound to its present values, one to its goals -
  * and they must agree on the offset at every instant, so the offset lives here and both hold a
- * pointer to it. Persisted to ~/.ros/dynamic_offset_transmissions/<joint>.txt.
+ * pointer to it. Persisted to ~/.ros/dynamic_offset_transmissions/<joint>.txt by a writer thread
+ * of its own, because a change can come from the control loop, which must not wait for a disk.
  */
 class JointOffset
 {
 public:
   explicit JointOffset( const std::string &joint_name, double initial_offset );
+  ~JointOffset();
+  JointOffset( const JointOffset & ) = delete;
+  JointOffset &operator=( const JointOffset & ) = delete;
+
+  /// Wait until every change so far is on disk, or failed to get there.
+  void flush();
 
   double value() const { return offset_; }
   void set( double offset );
@@ -86,7 +98,10 @@ public:
 private:
   bool existsTransmissionOffsetFile() const;
   void loadTransmissionOffset();
-  void saveTransmissionOffset() const;
+  void saveTransmissionOffset( double offset ) const;
+  /// Hand the current offset to the writer thread, without waiting for it.
+  void requestSave();
+  void writerLoop();
 
   std::string joint_name_;
   std::filesystem::path transmission_file_path_;
@@ -94,6 +109,15 @@ private:
   std::optional<double> prev_actuator_position_;
   std::optional<std::pair<double, double>> reset_window_;
   int correction_count_{ 0 };
+
+  std::atomic<double> offset_to_save_{ 0.0 };
+  std::atomic<uint64_t> saves_requested_{ 0 };
+  uint64_t saves_done_{ 0 };
+  bool stop_writer_{ false };
+  std::mutex writer_mutex_;
+  std::condition_variable writer_cv_;
+  std::condition_variable saved_cv_;
+  std::thread writer_;
 
   /// The number of turns a power cycle would have shifted the previous reading by, if any.
   std::optional<int> turnsOfAReset( double previous, double current ) const;
@@ -129,7 +153,7 @@ public:
   /***
    * \brief
    * Adjusts the transmission offset for the joint.
-   * This will also save the new offset to the file system.
+   * This also queues the new offset for the file system (see JointOffset::flush()).
    * WARNING: MAKE SURE TO DEACTIVATE THE CONTROLLER BEFORE CHANGING THE OFFSET!
    * @param offset The new offset to set for the joint.
    */
@@ -207,13 +231,61 @@ inline JointOffset::JointOffset( const std::string &joint_name, double initial_o
   if ( existsTransmissionOffsetFile() ) {
     loadTransmissionOffset();
   } else {
-    saveTransmissionOffset(); // save the initial offset to file
+    saveTransmissionOffset( offset_ ); // save the initial offset to file
   }
+  writer_ = std::thread( [this] { writerLoop(); } );
   if ( initial_offset != offset_ ) {
     RCLCPP_INFO( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                  "Loaded transmission offset for joint '%s': %f from file %s", joint_name_.c_str(),
                  offset_, transmission_file_path_.c_str() );
   }
+}
+
+inline JointOffset::~JointOffset()
+{
+  {
+    std::lock_guard<std::mutex> lock( writer_mutex_ );
+    stop_writer_ = true;
+  }
+  writer_cv_.notify_one();
+  writer_.join();
+}
+
+inline void JointOffset::requestSave()
+{
+  offset_to_save_.store( offset_ );
+  saves_requested_.fetch_add( 1 );
+  writer_cv_.notify_one();
+}
+
+inline void JointOffset::writerLoop()
+{
+  std::unique_lock<std::mutex> lock( writer_mutex_ );
+  while ( true ) {
+    // Woken by requestSave(), which does not take the lock, so a missed wake costs one period
+    writer_cv_.wait_for( lock, std::chrono::milliseconds( 100 ),
+                         [this] { return stop_writer_ || saves_requested_.load() != saves_done_; } );
+    const uint64_t requested = saves_requested_.load();
+    if ( requested != saves_done_ ) {
+      const double offset = offset_to_save_.load();
+      lock.unlock();
+      saveTransmissionOffset( offset );
+      lock.lock();
+      saves_done_ = requested;
+      saved_cv_.notify_all();
+    }
+    if ( stop_writer_ && saves_requested_.load() == saves_done_ ) {
+      return;
+    }
+  }
+}
+
+inline void JointOffset::flush()
+{
+  std::unique_lock<std::mutex> lock( writer_mutex_ );
+  const uint64_t requested = saves_requested_.load();
+  writer_cv_.notify_one();
+  saved_cv_.wait( lock, [this, requested] { return saves_done_ >= requested; } );
 }
 
 inline void JointOffset::set( double offset )
@@ -225,7 +297,7 @@ inline void JointOffset::set( double offset )
     return;
   }
   offset_ = offset;
-  saveTransmissionOffset();
+  requestSave();
 }
 
 inline std::optional<int> JointOffset::turnsOfAReset( double previous, double current ) const
@@ -281,7 +353,7 @@ inline int JointOffset::observeActuatorPosition( double actuator_position, doubl
       // The jump in joint space is n_jumps * 2pi / reduction; absorb it into the offset.
       offset_ -= n_jumps * TWO_PI / reduction;
       correction_count_ += std::abs( n_jumps );
-      saveTransmissionOffset();
+      requestSave();
       RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                    "Detected %d x 2pi actuator position jump on joint '%s' "
                    "(actuator delta: %.4f rad). Corrected offset to %.6f.",
@@ -340,14 +412,14 @@ inline void JointOffset::loadTransmissionOffset()
   offset_ = offset;
 }
 
-inline void JointOffset::saveTransmissionOffset() const
+inline void JointOffset::saveTransmissionOffset( double offset ) const
 {
   const auto logger = rclcpp::get_logger( "AdjustableOffsetTransmission" );
   std::error_code error;
   std::filesystem::create_directories( transmission_file_path_.parent_path(), error );
   if ( error ) {
-    // Reported rather than thrown: this runs from the control loop and from service callbacks,
-    // and an exception out of either takes the process with it.
+    // Reported rather than thrown: this runs on the writer thread, and an exception out of it
+    // takes the process with it.
     RCLCPP_ERROR( logger, "Failed to create the directory for %s: %s",
                   transmission_file_path_.string().c_str(), error.message().c_str() );
     return;
@@ -367,7 +439,7 @@ inline void JointOffset::saveTransmissionOffset() const
     }
     // Enough digits that loading gives back the offset that was saved. The stream default is six
     // significant digits, which loses roughly 1e-5 rad per save/load cycle on a multi-turn offset.
-    file << std::setprecision( std::numeric_limits<double>::max_digits10 ) << offset_;
+    file << std::setprecision( std::numeric_limits<double>::max_digits10 ) << offset;
     file.close();
     // After close(), which is where a deferred flush failure (a full disk) surfaces.
     if ( file.fail() ) {

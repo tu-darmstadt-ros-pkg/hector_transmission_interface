@@ -50,6 +50,8 @@ protected:
     if ( original_home_ ) {
       setenv( "HOME", original_home_, 1 );
     }
+    // The offsets' writer threads save into test_dir_ until they are gone
+    hardware_.reset();
     std::filesystem::remove_all( test_dir_ );
     HectorTestFixture::TearDown();
   }
