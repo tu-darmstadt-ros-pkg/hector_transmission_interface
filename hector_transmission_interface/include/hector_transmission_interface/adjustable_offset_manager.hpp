@@ -54,6 +54,11 @@ class AdjustableOffsetManager
 public:
   using PositionGetter = std::function<double()>;
   using ServiceCallback = std::function<bool()>;
+  /// Why a joint's offset may not change now, or an empty string if it may.
+  using MayAdjust = std::function<std::string( const std::string &joint )>;
+  /// Runs an adjustment where the hardware's control loop runs, and waits for it. False if it
+  /// could not be run, which refuses the request.
+  using RunInControlLoop = std::function<bool( const std::function<void()> &adjustment )>;
 
   /// A joint has one offset, however many transmissions read it.
   struct ManagedJoint {
@@ -86,7 +91,24 @@ public:
 
   void add_managed_joint( const std::string &name, ManagedJoint mj );
 
+  /// Refuse the joints @p may_adjust names a reason for. Asked where the adjustment runs.
+  void set_may_adjust( MayAdjust may_adjust ) { may_adjust_ = std::move( may_adjust ); }
+
+  /**
+   * @brief Run every adjustment through @p run, in place of taking the hardware mutex.
+   *
+   * read() and write() map with the offsets, so a hardware that runs the adjustment inside its
+   * control loop needs no lock against them. The post-callback and the position getters run there
+   * too.
+   */
+  void set_run_in_control_loop( RunInControlLoop run ) { run_in_control_loop_ = std::move( run ); }
+
 private:
+  /// Runs @p adjustment under the hardware mutex, or through the control loop if one is set.
+  bool runAdjustment( const std::function<void()> &adjustment );
+  /// The reason @p joint may not be adjusted, or an empty string.
+  std::string refusal( const std::string &joint ) const;
+
   void handle_service(
       const std::shared_ptr<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets::Request>
           request,
@@ -115,6 +137,8 @@ private:
   /// registration.
   mutable std::mutex managed_joints_mutex_;
   std::unordered_map<std::string, ManagedJoint> managed_joints_;
+  MayAdjust may_adjust_;
+  RunInControlLoop run_in_control_loop_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::AdjustTransmissionOffsets>::SharedPtr service_;
   rclcpp::Service<hector_transmission_interface_msgs::srv::FlipByPi>::SharedPtr flip_by_pi_service_;
 };
