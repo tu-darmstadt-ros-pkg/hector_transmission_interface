@@ -56,8 +56,8 @@ public:
   using ServiceCallback = std::function<bool()>;
   /// Why a joint's offset may not change now, or an empty string if it may.
   using MayAdjust = std::function<std::string( const std::string &joint )>;
-  /// Runs an adjustment where the hardware's control loop runs, and waits for it. False if it
-  /// could not be run, which refuses the request.
+  /// Runs an adjustment where the hardware's control loop runs, and waits for it. Returns false
+  /// only if the adjustment never ran and never will, because it refers to the caller's stack.
   using RunInControlLoop = std::function<bool( const std::function<void()> &adjustment )>;
 
   /// A joint has one offset, however many transmissions read it.
@@ -99,7 +99,7 @@ public:
    *
    * read() and write() map with the offsets, so a hardware that runs the adjustment inside its
    * control loop needs no lock against them. The post-callback and the position getters run there
-   * too.
+   * too, as do a mutex, logging and allocations, which is acceptable for a rare calibration.
    */
   void set_run_in_control_loop( RunInControlLoop run ) { run_in_control_loop_ = std::move( run ); }
 
