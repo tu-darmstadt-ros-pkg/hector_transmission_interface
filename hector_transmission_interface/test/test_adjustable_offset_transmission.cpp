@@ -769,6 +769,14 @@ protected:
     state->configure( jh, ah );
   }
 
+  void TearDown() override
+  {
+    // The offset's writer thread saves into the test home until it is gone
+    state.reset();
+    offset.reset();
+    AdjustableOffsetTransmissionTest::TearDown();
+  }
+
   void readAt( double pos )
   {
     actuator_pos = pos;
