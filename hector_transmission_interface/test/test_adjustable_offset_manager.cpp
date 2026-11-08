@@ -285,6 +285,35 @@ TEST_F( AdjustableOffsetManagerTest, NonFiniteSuppliedBaselineIsRefused )
 }
 
 /**
+ * Test: Finite inputs whose offset overflows are refused, not reported as applied.
+ */
+TEST_F( AdjustableOffsetManagerTest, AnOverflowingOffsetIsRefused )
+{
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock;
+  mj.position_getter = []() { return -1e308; };
+  manager_->add_managed_joint( "overflowing", mj );
+  EXPECT_CALL( *mock, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 0 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "overflowing" };
+  request->external_joint_measurements.position = { 1e308 };
+  EXPECT_CALL(
+      *service,
+      send_response( *request_header,
+                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, false ),
+                                     Field( &AdjustTransmissionOffsets::Response::offset_changes,
+                                            testing::IsEmpty() ) ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
  * Test: An empty request adjusted nothing, so it did not succeed.
  */
 TEST_F( AdjustableOffsetManagerTest, EmptyRequestIsNotASuccess )
@@ -789,12 +818,13 @@ bool g_adjusting = false;
 std::vector<std::string> g_logged_while_adjusting;
 std::vector<std::string> g_logged;
 
-void record_log( const rcutils_log_location_t *, int, const char *, rcutils_time_point_value_t,
-                 const char *format, va_list *args )
+void record_log( const rcutils_log_location_t *, int severity, const char *,
+                 rcutils_time_point_value_t, const char *format, va_list *args )
 {
   char buffer[512];
   vsnprintf( buffer, sizeof( buffer ), format, *args );
-  ( g_adjusting ? g_logged_while_adjusting : g_logged ).emplace_back( buffer );
+  ( g_adjusting ? g_logged_while_adjusting : g_logged )
+      .push_back( std::string( g_rcutils_log_severity_names[severity] ) + " " + buffer );
 }
 
 std::string joined( const std::vector<std::string> &lines )
@@ -818,13 +848,16 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, NothingIsLoggedWhileTheAdjustmentR
   } );
   auto flippable = std::make_shared<MockAdjustableOffset>();
   auto unmeasurable = std::make_shared<MockAdjustableOffset>();
+  auto overflowing = std::make_shared<MockAdjustableOffset>();
   EXPECT_CALL( *flippable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
   EXPECT_CALL( *flippable, adjustOffset( testing::_ ) ).Times( 1 );
   EXPECT_CALL( *unmeasurable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *overflowing, getOffset() ).WillRepeatedly( Return( 0.0 ) );
   manager->add_managed_joint( "flippable", managed( flippable ) );
   manager->add_managed_joint( "no_handle", AdjustableOffsetManager::ManagedJoint{} );
   manager->add_managed_joint(
       "unmeasurable", { unmeasurable, [] { return std::numeric_limits<double>::quiet_NaN(); } } );
+  manager->add_managed_joint( "overflowing", { overflowing, [] { return -1e308; } } );
 
   auto adjust =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
@@ -836,6 +869,8 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, NothingIsLoggedWhileTheAdjustmentR
   adjust_request->external_joint_measurements.name.push_back( "nan" );
   adjust_request->external_joint_measurements.position.push_back(
       std::numeric_limits<double>::quiet_NaN() );
+  adjust_request->external_joint_measurements.name.push_back( "overflowing" );
+  adjust_request->external_joint_measurements.position.push_back( 1e308 );
   auto flip_request = std::make_shared<FlipByPi::Request>();
   flip_request->joint_names = { "flippable", "no_handle", "ghost" };
 
@@ -850,10 +885,11 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, NothingIsLoggedWhileTheAdjustmentR
   EXPECT_TRUE( g_logged_while_adjusting.empty() ) << joined( g_logged_while_adjusting );
   const std::string logged = joined( g_logged );
   for ( const std::string expected :
-        { "Received NaN for joint nan", "Joint 'no_handle' has no offset handle registered",
-          "Joint 'unmeasurable' has no usable position", "Flipped joint 'flippable' by pi",
-          "Joint 'ghost' not found" } ) {
+        { "WARN Received NaN for joint nan", "WARN Joint 'no_handle' has no offset handle registered",
+          "ERROR Joint 'unmeasurable' has no usable position",
+          "ERROR Joint 'overflowing' would get the offset inf",
+          "INFO Flipped joint 'flippable' by pi", "WARN Joint 'ghost' not found" } ) {
     EXPECT_THAT( logged, testing::HasSubstr( expected ) );
   }
-  EXPECT_EQ( std::count( g_logged.begin(), g_logged.end(), "Post-callback returned false." ), 2 );
+  EXPECT_EQ( std::count( g_logged.begin(), g_logged.end(), "WARN Post-callback returned false." ), 2 );
 }

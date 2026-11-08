@@ -194,6 +194,12 @@ void AdjustableOffsetManager::handle_service(
       }
       double corrected_offset =
           request->external_joint_measurements.position[i] - internal_pos + current_offset;
+      // Finite inputs can still overflow, and JointOffset would refuse the result anyway
+      if ( !std::isfinite( corrected_offset ) ) {
+        log.error.push_back( "Joint '" + joint_name + "' would get the offset " +
+                             std::to_string( corrected_offset ) + ". Skipping it." );
+        continue;
+      }
 
       mj.handle->adjustOffset( corrected_offset );
 
