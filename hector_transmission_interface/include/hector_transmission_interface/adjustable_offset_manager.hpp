@@ -99,8 +99,8 @@ public:
    *
    * read() and write() map with the offsets, so a hardware that runs the adjustment inside its
    * control loop needs no lock against them. The post-callback and the position getters run there
-   * too, as do a mutex and allocations, which is acceptable for a rare calibration. Logging waits
-   * until it returns.
+   * too, as do a mutex and allocations, which is acceptable for a rare calibration. Their
+   * messages are logged after the adjustment returns.
    */
   void set_run_in_control_loop( RunInControlLoop run ) { run_in_control_loop_ = std::move( run ); }
 
