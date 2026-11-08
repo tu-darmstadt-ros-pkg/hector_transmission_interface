@@ -1,9 +1,12 @@
+#include <algorithm>
+#include <cstdio>
 #include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "hector_transmission_interface/adjustable_offset_manager.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rcutils/logging.h"
 #include "rtest/service_mock.hpp"
 
 using namespace hector_transmission_interface;
@@ -778,4 +781,79 @@ TEST_F( AdjustableOffsetManagerTestMutex, FlipByPiRefusesAJointThatMayNotBeAdjus
   request->joint_names = { "claimed" };
   EXPECT_CALL( *service, send_response( *header, Field( &FlipByPi::Response::success, false ) ) );
   service->handle_request( header, request );
+}
+
+namespace
+{
+bool g_adjusting = false;
+std::vector<std::string> g_logged_while_adjusting;
+std::vector<std::string> g_logged;
+
+void record_log( const rcutils_log_location_t *, int, const char *, rcutils_time_point_value_t,
+                 const char *format, va_list *args )
+{
+  char buffer[512];
+  vsnprintf( buffer, sizeof( buffer ), format, *args );
+  ( g_adjusting ? g_logged_while_adjusting : g_logged ).emplace_back( buffer );
+}
+
+std::string joined( const std::vector<std::string> &lines )
+{
+  std::string all;
+  for ( const auto &line : lines ) all += line + "\n";
+  return all;
+}
+} // namespace
+
+/* Test: Nothing is logged while the bus is held, but every skip and flip is logged afterwards. */
+TEST_F( AdjustableOffsetManagerTestCallbacks, NothingIsLoggedWhileTheAdjustmentRuns )
+{
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::nullopt, std::make_optional( [] { return false; } ) );
+  manager->set_run_in_control_loop( []( const std::function<void()> &adjustment ) {
+    g_adjusting = true;
+    adjustment();
+    g_adjusting = false;
+    return true;
+  } );
+  auto flippable = std::make_shared<MockAdjustableOffset>();
+  auto unmeasurable = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *flippable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *flippable, adjustOffset( testing::_ ) ).Times( 1 );
+  EXPECT_CALL( *unmeasurable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  manager->add_managed_joint( "flippable", managed( flippable ) );
+  manager->add_managed_joint( "no_handle", AdjustableOffsetManager::ManagedJoint{} );
+  manager->add_managed_joint(
+      "unmeasurable", { unmeasurable, [] { return std::numeric_limits<double>::quiet_NaN(); } } );
+
+  auto adjust =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto flip = rtest::findService<FlipByPi>( node_, "~/flip_by_pi" );
+  ASSERT_TRUE( adjust && flip );
+  EXPECT_CALL( *adjust, send_response( testing::_, testing::_ ) );
+  EXPECT_CALL( *flip, send_response( testing::_, testing::_ ) );
+  auto adjust_request = measure( { "no_handle", "unmeasurable" }, 1.5 );
+  adjust_request->external_joint_measurements.name.push_back( "nan" );
+  adjust_request->external_joint_measurements.position.push_back(
+      std::numeric_limits<double>::quiet_NaN() );
+  auto flip_request = std::make_shared<FlipByPi::Request>();
+  flip_request->joint_names = { "flippable", "no_handle", "ghost" };
+
+  g_logged.clear();
+  g_logged_while_adjusting.clear();
+  const auto previous_handler = rcutils_logging_get_output_handler();
+  rcutils_logging_set_output_handler( record_log );
+  adjust->handle_request( std::make_shared<rmw_request_id_t>(), adjust_request );
+  flip->handle_request( std::make_shared<rmw_request_id_t>(), flip_request );
+  rcutils_logging_set_output_handler( previous_handler );
+
+  EXPECT_TRUE( g_logged_while_adjusting.empty() ) << joined( g_logged_while_adjusting );
+  const std::string logged = joined( g_logged );
+  for ( const std::string expected :
+        { "Received NaN for joint nan", "Joint 'no_handle' has no offset handle registered",
+          "Joint 'unmeasurable' has no usable position", "Flipped joint 'flippable' by pi",
+          "Joint 'ghost' not found" } ) {
+    EXPECT_THAT( logged, testing::HasSubstr( expected ) );
+  }
+  EXPECT_EQ( std::count( g_logged.begin(), g_logged.end(), "Post-callback returned false." ), 2 );
 }

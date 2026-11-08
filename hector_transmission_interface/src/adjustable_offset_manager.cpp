@@ -2,9 +2,25 @@
 
 #include <cmath>
 #include <set>
+#include <vector>
 
 namespace hector_transmission_interface
 {
+namespace
+{
+// Filled where the bus is held and logged after it is released, since logging has no time bound.
+struct DeferredLog {
+  std::vector<std::string> info, warn, error;
+
+  void flush( const rclcpp::Logger &logger ) const
+  {
+    for ( const auto &message : info ) RCLCPP_INFO( logger, "%s", message.c_str() );
+    for ( const auto &message : warn ) RCLCPP_WARN( logger, "%s", message.c_str() );
+    for ( const auto &message : error ) RCLCPP_ERROR( logger, "%s", message.c_str() );
+  }
+};
+} // namespace
+
 /**
  * @brief Concrete adapter mapping the interface to the non-virtual transmission methods.
  */
@@ -119,6 +135,7 @@ void AdjustableOffsetManager::handle_service(
 
   const size_t num_measurements = request->external_joint_measurements.name.size();
   std::vector<std::string> refused;
+  DeferredLog log;
 
   // Under the hardware mutex or in the control loop, including the post-callback and every
   // position_getter call
@@ -130,7 +147,7 @@ void AdjustableOffsetManager::handle_service(
       double external_pos = request->external_joint_measurements.position[i];
 
       if ( !std::isfinite( external_pos ) ) {
-        RCLCPP_WARN( node_->get_logger(), "Received NaN for joint %s, skipping.", joint_name.c_str() );
+        log.warn.push_back( "Received NaN for joint " + joint_name + ", skipping." );
         continue;
       }
 
@@ -140,8 +157,7 @@ void AdjustableOffsetManager::handle_service(
 
       auto &mj = it->second;
       if ( !mj.handle ) {
-        RCLCPP_WARN( node_->get_logger(), "Joint '%s' has no offset handle registered, skipping.",
-                     joint_name.c_str() );
+        log.warn.push_back( "Joint '" + joint_name + "' has no offset handle registered, skipping." );
         continue;
       }
       if ( const std::string reason = refusal( joint_name ); !reason.empty() ) {
@@ -170,11 +186,10 @@ void AdjustableOffsetManager::handle_service(
       // whatever the hardware last read, which is not a position at all before the first read
       // succeeds, and an offset derived from one is written to disk and poisons every later reading.
       if ( !std::isfinite( internal_pos ) || !std::isfinite( current_offset ) ) {
-        RCLCPP_ERROR(
-            node_->get_logger(),
-            "Joint '%s' has no usable position to calibrate against (baseline %f, current "
-            "offset %f). Skipping it.",
-            joint_name.c_str(), internal_pos, current_offset );
+        log.error.push_back( "Joint '" + joint_name +
+                             "' has no usable position to calibrate against (baseline " +
+                             std::to_string( internal_pos ) + ", current offset " +
+                             std::to_string( current_offset ) + "). Skipping it." );
         continue;
       }
       double corrected_offset =
@@ -188,9 +203,10 @@ void AdjustableOffsetManager::handle_service(
       response->joint_names.push_back( joint_name );
     }
     if ( post_callback_locked_.has_value() && !post_callback_locked_.value()() ) {
-      RCLCPP_WARN( node_->get_logger(), "Post-callback returned false." );
+      log.warn.push_back( "Post-callback returned false." );
     }
   } );
+  log.flush( node_->get_logger() );
   if ( !ran ) {
     response->offset_changes.clear();
     response->joint_names.clear();
@@ -239,6 +255,7 @@ void AdjustableOffsetManager::handle_flip_by_pi(
 
   size_t flipped_count = 0;
   std::vector<std::string> refused;
+  DeferredLog log;
 
   // A name repeated in one request would otherwise be flipped twice, which is a full turn of the
   // joint rather than a half one.
@@ -249,14 +266,13 @@ void AdjustableOffsetManager::handle_flip_by_pi(
     for ( const auto &joint_name : requested ) {
       auto it = managed_joints_.find( joint_name );
       if ( it == managed_joints_.end() ) {
-        RCLCPP_WARN( node_->get_logger(), "Joint '%s' not found, skipping.", joint_name.c_str() );
+        log.warn.push_back( "Joint '" + joint_name + "' not found, skipping." );
         continue;
       }
 
       auto &mj = it->second;
       if ( !mj.handle ) {
-        RCLCPP_WARN( node_->get_logger(), "Joint '%s' has no offset handle registered, skipping.",
-                     joint_name.c_str() );
+        log.warn.push_back( "Joint '" + joint_name + "' has no offset handle registered, skipping." );
         continue;
       }
       if ( const std::string reason = refusal( joint_name ); !reason.empty() ) {
@@ -266,13 +282,14 @@ void AdjustableOffsetManager::handle_flip_by_pi(
 
       mj.handle->adjustOffset( mj.handle->getOffset() + M_PI );
 
-      RCLCPP_INFO( node_->get_logger(), "Flipped joint '%s' by pi.", joint_name.c_str() );
+      log.info.push_back( "Flipped joint '" + joint_name + "' by pi." );
       ++flipped_count;
     }
     if ( post_callback_locked_.has_value() && !post_callback_locked_.value()() ) {
-      RCLCPP_WARN( node_->get_logger(), "Post-callback returned false." );
+      log.warn.push_back( "Post-callback returned false." );
     }
   } );
+  log.flush( node_->get_logger() );
   if ( !ran ) {
     response->success = false;
     response->message = "The hardware could not run the flip, nothing was changed";
