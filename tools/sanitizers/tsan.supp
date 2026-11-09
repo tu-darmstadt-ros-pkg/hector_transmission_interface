@@ -14,6 +14,7 @@ called_from_lib:librmw_dds_common.so
 called_from_lib:librmw_cyclonedds_cpp.so
 called_from_lib:librmw_implementation.so
 called_from_lib:librmw.so
+# Also hides a real Cyclone 11.0.1 typelib race, ddsi_topic_descriptor_from_type walks gv->typedeps unlocked during concurrent entity creation.
 called_from_lib:libddsc.so
 
 # --- Fast-DDS ---------------------------------------------------------------
