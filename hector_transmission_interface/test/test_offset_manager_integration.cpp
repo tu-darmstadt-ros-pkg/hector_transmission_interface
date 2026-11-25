@@ -50,6 +50,8 @@ protected:
     if ( original_home_ ) {
       setenv( "HOME", original_home_, 1 );
     }
+    // The offsets' writer threads save into test_dir_ until they are gone
+    hardware_.reset();
     std::filesystem::remove_all( test_dir_ );
     HectorTestFixture::TearDown();
   }
@@ -92,6 +94,41 @@ TEST_F( OffsetManagerIntegrationTest, UpdateOffsetAndVerify )
   std::filesystem::path offset_file =
       std::filesystem::path( test_dir_ ) / ".ros" / "dynamic_offset_transmissions" / ( j + ".txt" );
   ASSERT_TRUE( std::filesystem::exists( offset_file ) );
+}
+
+TEST_F( OffsetManagerIntegrationTest, AdjustingTheOffsetDoesNotMoveTheActuator )
+{
+  // The two sides share one offset, but the command side keeps its own joint goal, computed under
+  // the offset that was current when the controller wrote it. Mapping that goal down again after
+  // an adjustment sends the actuator somewhere it was never told to go: the joint holds still on
+  // paper while the motor jumps by the offset change. write() keeps running whatever the
+  // controllers are doing, so deactivating them does not prevent it.
+  std::string j = "test_joint";
+  hardware_->set_raw_actuator_position( j, 1.0 );
+  hardware_->propagate_read();
+  ASSERT_NEAR( hardware_->get_joint_position( j ), 1.0, 1e-6 );
+
+  // A controller commands the joint to hold where it is.
+  hardware_->set_joint_command( j, 1.0 );
+  hardware_->propagate_write();
+  const double actuator_goal_before = hardware_->get_actuator_command( j );
+  ASSERT_NEAR( actuator_goal_before, 1.0, 1e-6 );
+
+  ASSERT_TRUE( client_->wait_for_service( *executor_, std::chrono::seconds( 5 ) ) );
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name.push_back( j );
+  request->external_joint_measurements.position.push_back( 2.5 ); // offset moves by +1.5
+
+  auto response = hector_testing_utils::call_service<AdjustTransmissionOffsets>(
+      client_->get(), request, *executor_ );
+  ASSERT_NE( response, nullptr );
+  ASSERT_TRUE( response->success ) << response->message;
+
+  // The next write happens whether or not a controller has written a new goal.
+  hardware_->propagate_write();
+  EXPECT_NEAR( hardware_->get_actuator_command( j ), actuator_goal_before, 1e-6 )
+      << "Re-calibrating the joint moved the actuator goal by the offset change, so the motor is "
+         "driven away from where it was holding.";
 }
 
 TEST_F( OffsetManagerIntegrationTest, PersistenceAcrossRestarts )

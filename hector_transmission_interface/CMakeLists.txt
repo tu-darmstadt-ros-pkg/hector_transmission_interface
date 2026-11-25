@@ -33,8 +33,11 @@ target_include_directories(
 
 target_link_libraries(${PROJECT_NAME} ${THIS_PACKAGE_INCLUDE_DEPENDS_TARGETS})
 
-# Pluginlib Export
-pluginlib_export_plugin_description_file(${PROJECT_NAME}
+# Pluginlib Export. The package named here is the one that owns the base class,
+# which is where a ClassLoader<transmission_interface::TransmissionLoader>
+# looks. Exporting under this package instead registers the description where
+# nothing goes looking for it.
+pluginlib_export_plugin_description_file(transmission_interface
                                          ros2_control_plugins.xml)
 
 # --- Testing Section ---
@@ -50,6 +53,12 @@ if(BUILD_TESTING)
   target_link_libraries(
     test_adjustable_offset_transmission ${PROJECT_NAME} rclcpp::rclcpp
     transmission_interface::transmission_interface)
+
+  # 1b. The exported plugin description must actually resolve through pluginlib.
+  ament_add_gtest(test_plugin_export test/test_plugin_export.cpp)
+  target_link_libraries(test_plugin_export ${PROJECT_NAME})
+  target_link_libraries(test_plugin_export pluginlib::pluginlib
+                        transmission_interface::transmission_interface)
 
   # 1. Add the Manager test (GMock + rtest) NOTE: Added test/main.cpp which is
   #   required for initializing ROS2/GTest context

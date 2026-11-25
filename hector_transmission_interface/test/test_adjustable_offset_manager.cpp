@@ -1,9 +1,12 @@
+#include <algorithm>
+#include <cstdio>
 #include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "hector_transmission_interface/adjustable_offset_manager.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rcutils/logging.h"
 #include "rtest/service_mock.hpp"
 
 using namespace hector_transmission_interface;
@@ -58,7 +61,6 @@ protected:
 TEST_F( AdjustableOffsetManagerTest, RobustOffsetCalculation )
 {
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   std::string joint_name = "flipper_joint";
 
   // Logic: NewOffset = External(1.2) - Internal(1.0) + CurrentOffset(0.5) = 0.7
@@ -72,12 +74,9 @@ TEST_F( AdjustableOffsetManagerTest, RobustOffsetCalculation )
   // Setup Mock expectations for the internal transmission handles
   EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( old_offset ) );
   EXPECT_CALL( *mock_state, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-
   // Inject mocks into manager
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = [&]() { return current_internal_val; };
   manager_->add_managed_joint( joint_name, mj );
 
@@ -117,7 +116,6 @@ TEST_F( AdjustableOffsetManagerTest, RobustOffsetCalculation )
 TEST_F( AdjustableOffsetManagerTest, CalculationWithOriginalState )
 {
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   std::string joint_name = "flipper_joint";
 
   // Current hardware state is 1.0, but original measurement state was 0.8
@@ -129,11 +127,8 @@ TEST_F( AdjustableOffsetManagerTest, CalculationWithOriginalState )
 
   EXPECT_CALL( *mock_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_state, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = [&]() { return current_internal_val; };
   manager_->add_managed_joint( joint_name, mj );
 
@@ -164,20 +159,16 @@ TEST_F( AdjustableOffsetManagerTest, CalculationWithOriginalState )
 TEST_F( AdjustableOffsetManagerTest, PartialOriginalStateFallback )
 {
   auto mock_a_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_a_cmd = std::make_shared<MockAdjustableOffset>();
   auto mock_b_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_b_cmd = std::make_shared<MockAdjustableOffset>();
 
   // Joint A: External(1.5) - Original(1.0) + Offset(0.0) = 0.5
   // Joint B: External(2.5) - Current(2.0) + Offset(0.0) = 0.5
 
   AdjustableOffsetManager::ManagedJoint mj_a, mj_b;
-  mj_a.state_handle = mock_a_state;
-  mj_a.command_handle = mock_a_cmd;
+  mj_a.handle = mock_a_state;
   mj_a.position_getter = []() { return 999.0; }; // Should be ignored for A
 
-  mj_b.state_handle = mock_b_state;
-  mj_b.command_handle = mock_b_cmd;
+  mj_b.handle = mock_b_state;
   mj_b.position_getter = []() { return 2.0; }; // Used for B
 
   manager_->add_managed_joint( "joint_a", mj_a );
@@ -197,11 +188,9 @@ TEST_F( AdjustableOffsetManagerTest, PartialOriginalStateFallback )
 
   EXPECT_CALL( *mock_a_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_a_state, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_a_cmd, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
 
   EXPECT_CALL( *mock_b_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_b_state, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_b_cmd, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
 
   EXPECT_CALL( *service,
                send_response( *request_header,
@@ -241,7 +230,7 @@ TEST_F( AdjustableOffsetManagerTest, HandlingNaNValues )
 {
   auto mock = std::make_shared<MockAdjustableOffset>();
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mj.command_handle = mock;
+  mj.handle = mock;
   mj.position_getter = []() { return 1.0; };
   manager_->add_managed_joint( "nan_joint", mj );
 
@@ -264,12 +253,99 @@ TEST_F( AdjustableOffsetManagerTest, HandlingNaNValues )
 }
 
 /**
+ * Test: A baseline the caller supplied but that is not a number.
+ * Falling back to the live position calibrates against a pose the measurement was not taken in.
+ */
+TEST_F( AdjustableOffsetManagerTest, NonFiniteSuppliedBaselineIsRefused )
+{
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock;
+  // The joint itself is readable. The caller's own baseline is not.
+  mj.position_getter = []() { return 0.5; };
+  manager_->add_managed_joint( "unread_joint", mj );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "unread_joint" };
+  request->external_joint_measurements.position = { 1.0 };
+  // Saying "the measurement was taken at this pose" and giving a value that is not one. Silently
+  // substituting where the joint is now calibrates against a different pose.
+  request->original_joint_state.name = { "unread_joint" };
+  request->original_joint_state.position = { std::numeric_limits<double>::quiet_NaN() };
+
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 0 );
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
+ * Test: Finite inputs whose offset overflows are refused, not reported as applied.
+ */
+TEST_F( AdjustableOffsetManagerTest, AnOverflowingOffsetIsRefused )
+{
+  auto mock = std::make_shared<MockAdjustableOffset>();
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock;
+  mj.position_getter = []() { return -1e308; };
+  manager_->add_managed_joint( "overflowing", mj );
+  EXPECT_CALL( *mock, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock, adjustOffset( testing::_ ) ).Times( 0 );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  request->external_joint_measurements.name = { "overflowing" };
+  request->external_joint_measurements.position = { 1e308 };
+  EXPECT_CALL(
+      *service,
+      send_response( *request_header,
+                     testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, false ),
+                                     Field( &AdjustTransmissionOffsets::Response::offset_changes,
+                                            testing::IsEmpty() ) ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
+ * Test: An empty request adjusted nothing, so it did not succeed.
+ */
+TEST_F( AdjustableOffsetManagerTest, EmptyRequestIsNotASuccess )
+{
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) );
+
+  service->handle_request( request_header, request );
+}
+
+/**
  * Test: Mismatched Array Sizes
  * Scenario: User sends 2 names but only 1 position.
- * This tests the robustness of the loop indices.
+ * A JointState whose arrays disagree cannot attribute its positions to names, so the request is
+ * refused whole rather than calibrated against whichever entries happen to line up.
  */
 TEST_F( AdjustableOffsetManagerTest, MismatchedArraySizes )
 {
+  auto mock_state = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 0 );
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock_state;
+  mj.position_getter = []() { return 0.0; };
+  manager_->add_managed_joint( "j1", mj );
+
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   auto request_header = std::make_shared<rmw_request_id_t>();
@@ -278,9 +354,44 @@ TEST_F( AdjustableOffsetManagerTest, MismatchedArraySizes )
   request->external_joint_measurements.name = { "j1", "j2" };
   request->external_joint_measurements.position = { 1.0 }; // Only one!
 
-  // Manager should handle this without out_of_bounds exception
-  // Usually by iterating based on the smaller of the two sizes or the name size with a check.
-  EXPECT_CALL( *service, send_response( *request_header, testing::_ ) ).Times( 1 );
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) )
+      .Times( 1 );
+
+  service->handle_request( request_header, request );
+}
+
+/**
+ * Test: Mismatched original_joint_state Array Sizes
+ * Scenario: The optional baseline carries names but no positions.
+ * The baseline lookup walks the name array, so a shorter position array is read past its end: an
+ * out-of-bounds double becomes the calibration baseline and is persisted as an offset.
+ */
+TEST_F( AdjustableOffsetManagerTest, MismatchedOriginalJointStateArraySizes )
+{
+  auto mock_state = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 0 );
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = mock_state;
+  mj.position_getter = []() { return 0.0; };
+  manager_->add_managed_joint( "j1", mj );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto request_header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+
+  request->external_joint_measurements.name = { "j1" };
+  request->external_joint_measurements.position = { 1.0 };
+  request->original_joint_state.name = { "j1" };
+  request->original_joint_state.position = {}; // names without the positions they name
+
+  EXPECT_CALL( *service,
+               send_response( *request_header,
+                              Field( &AdjustTransmissionOffsets::Response::success, false ) ) )
+      .Times( 1 );
 
   service->handle_request( request_header, request );
 }
@@ -328,7 +439,6 @@ TEST_F( AdjustableOffsetManagerTestMutex, VerifyServiceWaitsForMutex )
 TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
 {
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   std::string joint_name = "flipper_joint";
 
   // Logic: NewOffset = External(1.2) - Internal(1.0) + CurrentOffset(0.5) = 0.7
@@ -342,12 +452,9 @@ TEST_F( AdjustableOffsetManagerTestMutex, RobustOffsetCalculation )
   // Setup Mock expectations for the internal transmission handles
   EXPECT_CALL( *mock_state, getOffset() ).WillRepeatedly( Return( old_offset ) );
   EXPECT_CALL( *mock_state, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( DoubleEq( expected_new_offset ) ) ).Times( 1 );
-
   // Inject mocks into manager
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = [&]() { return current_internal_val; };
   manager_->add_managed_joint( joint_name, mj );
 
@@ -405,17 +512,13 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, PreCallbackReturnsFalseAbortsServi
       node_, std::nullopt, std::make_optional( pre_callback ), std::nullopt );
 
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = []() { return 1.0; };
   manager->add_managed_joint( "test_joint", mj );
 
   // adjustOffset should NOT be called if pre-callback returns false
   EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 0 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( testing::_ ) ).Times( 0 );
-
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   ASSERT_TRUE( service );
@@ -451,17 +554,13 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, PreCallbackReturnsTrueAllowsProces
       node_, std::nullopt, std::make_optional( pre_callback ), std::nullopt );
 
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = []() { return 1.0; };
   manager->add_managed_joint( "test_joint", mj );
 
   EXPECT_CALL( *mock_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_state, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
-
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   auto request_header = std::make_shared<rmw_request_id_t>();
@@ -492,17 +591,13 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, PostCallbackCalledAfterProcessing 
                                                             std::make_optional( post_callback ) );
 
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = []() { return 1.0; };
   manager->add_managed_joint( "test_joint", mj );
 
   EXPECT_CALL( *mock_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( testing::_ ) ).Times( 1 );
-
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   auto request_header = std::make_shared<rmw_request_id_t>();
@@ -570,17 +665,13 @@ TEST_F( AdjustableOffsetManagerTestCallbacks, BothCallbacksExecuteInOrder )
       node_, std::nullopt, std::make_optional( pre_callback ), std::make_optional( post_callback ) );
 
   auto mock_state = std::make_shared<MockAdjustableOffset>();
-  auto mock_cmd = std::make_shared<MockAdjustableOffset>();
   AdjustableOffsetManager::ManagedJoint mj;
-  mj.state_handle = mock_state;
-  mj.command_handle = mock_cmd;
+  mj.handle = mock_state;
   mj.position_getter = []() { return 1.0; };
   manager->add_managed_joint( "test_joint", mj );
 
   EXPECT_CALL( *mock_state, getOffset() ).WillOnce( Return( 0.0 ) );
   EXPECT_CALL( *mock_state, adjustOffset( testing::_ ) ).Times( 1 );
-  EXPECT_CALL( *mock_cmd, adjustOffset( testing::_ ) ).Times( 1 );
-
   auto service =
       rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
   auto request_header = std::make_shared<rmw_request_id_t>();
@@ -603,4 +694,202 @@ int main( int argc, char **argv )
   int result = RUN_ALL_TESTS();
   rclcpp::shutdown();
   return result;
+}
+
+namespace
+{
+std::shared_ptr<AdjustTransmissionOffsets::Request> measure( const std::vector<std::string> &joints,
+                                                             double position )
+{
+  auto request = std::make_shared<AdjustTransmissionOffsets::Request>();
+  for ( const auto &joint : joints ) {
+    request->external_joint_measurements.name.push_back( joint );
+    request->external_joint_measurements.position.push_back( position );
+  }
+  return request;
+}
+
+AdjustableOffsetManager::ManagedJoint managed( const std::shared_ptr<MockAdjustableOffset> &handle )
+{
+  AdjustableOffsetManager::ManagedJoint mj;
+  mj.handle = handle;
+  mj.position_getter = [] { return 1.0; };
+  return mj;
+}
+} // namespace
+
+/* Test: A joint the hardware may not adjust now is refused, the others are adjusted. */
+TEST_F( AdjustableOffsetManagerTestMutex, AJointThatMayNotBeAdjustedIsRefused )
+{
+  auto free_joint = std::make_shared<MockAdjustableOffset>();
+  auto claimed_joint = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *free_joint, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *claimed_joint, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *free_joint, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
+  EXPECT_CALL( *claimed_joint, adjustOffset( testing::_ ) ).Times( 0 );
+  manager_->add_managed_joint( "free", managed( free_joint ) );
+  manager_->add_managed_joint( "claimed", managed( claimed_joint ) );
+  manager_->set_may_adjust( []( const std::string &joint ) {
+    return joint == "claimed" ? std::string( "a controller commands it" ) : std::string();
+  } );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto header = std::make_shared<rmw_request_id_t>();
+  EXPECT_CALL(
+      *service,
+      send_response(
+          *header,
+          testing::AllOf( Field( &AdjustTransmissionOffsets::Response::success, false ),
+                          Field( &AdjustTransmissionOffsets::Response::message,
+                                 testing::HasSubstr( "claimed (a controller commands it)" ) ) ) ) );
+  service->handle_request( header, measure( { "free", "claimed" }, 1.5 ) );
+}
+
+/* Test: With a control loop hook the adjustment runs there, and the hardware mutex is not taken. */
+TEST_F( AdjustableOffsetManagerTestMutex, TheAdjustmentRunsInTheControlLoop )
+{
+  auto joint = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *joint, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *joint, adjustOffset( DoubleEq( 0.5 ) ) ).Times( 1 );
+  manager_->add_managed_joint( "joint", managed( joint ) );
+  int runs = 0;
+  manager_->set_run_in_control_loop( [&runs]( const std::function<void()> &adjustment ) {
+    ++runs;
+    adjustment();
+    return true;
+  } );
+
+  // Held by the test, as by a running read(): the hook must be the only way in
+  std::unique_lock<std::mutex> held( blocking_mutex );
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto header = std::make_shared<rmw_request_id_t>();
+  EXPECT_CALL( *service, send_response( *header, Field( &AdjustTransmissionOffsets::Response::success,
+                                                        true ) ) );
+  auto done = std::async( std::launch::async,
+                          [&] { service->handle_request( header, measure( { "joint" }, 1.5 ) ); } );
+  const bool ran_without_the_mutex =
+      done.wait_for( std::chrono::seconds( 2 ) ) == std::future_status::ready;
+  held.unlock();
+  ASSERT_TRUE( ran_without_the_mutex )
+      << "the adjustment waited for the hardware mutex instead of running in the control loop";
+  EXPECT_EQ( runs, 1 );
+}
+
+/* Test: An adjustment the control loop does not run changes nothing and is refused. */
+TEST_F( AdjustableOffsetManagerTestMutex, AnAdjustmentTheControlLoopDoesNotRunIsRefused )
+{
+  auto joint = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *joint, adjustOffset( testing::_ ) ).Times( 0 );
+  manager_->add_managed_joint( "joint", managed( joint ) );
+  manager_->set_run_in_control_loop( []( const std::function<void()> & ) { return false; } );
+
+  auto service =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto header = std::make_shared<rmw_request_id_t>();
+  EXPECT_CALL( *service, send_response( *header, Field( &AdjustTransmissionOffsets::Response::success,
+                                                        false ) ) );
+  service->handle_request( header, measure( { "joint" }, 1.5 ) );
+}
+
+/* Test: flip_by_pi refuses a joint the hardware may not adjust now. */
+TEST_F( AdjustableOffsetManagerTestMutex, FlipByPiRefusesAJointThatMayNotBeAdjusted )
+{
+  auto joint = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *joint, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *joint, adjustOffset( testing::_ ) ).Times( 0 );
+  manager_->add_managed_joint( "claimed", managed( joint ) );
+  manager_->set_may_adjust(
+      []( const std::string & ) { return std::string( "a controller commands it" ); } );
+
+  auto service = rtest::findService<FlipByPi>( node_, "~/flip_by_pi" );
+  ASSERT_NE( service, nullptr );
+  auto header = std::make_shared<rmw_request_id_t>();
+  auto request = std::make_shared<FlipByPi::Request>();
+  request->joint_names = { "claimed" };
+  EXPECT_CALL( *service, send_response( *header, Field( &FlipByPi::Response::success, false ) ) );
+  service->handle_request( header, request );
+}
+
+namespace
+{
+bool g_adjusting = false;
+std::vector<std::string> g_logged_while_adjusting;
+std::vector<std::string> g_logged;
+
+void record_log( const rcutils_log_location_t *, int severity, const char *,
+                 rcutils_time_point_value_t, const char *format, va_list *args )
+{
+  char buffer[512];
+  vsnprintf( buffer, sizeof( buffer ), format, *args );
+  ( g_adjusting ? g_logged_while_adjusting : g_logged )
+      .push_back( std::string( g_rcutils_log_severity_names[severity] ) + " " + buffer );
+}
+
+std::string joined( const std::vector<std::string> &lines )
+{
+  std::string all;
+  for ( const auto &line : lines ) all += line + "\n";
+  return all;
+}
+} // namespace
+
+/* Test: Nothing is logged while the bus is held, but every skip and flip is logged afterwards. */
+TEST_F( AdjustableOffsetManagerTestCallbacks, NothingIsLoggedWhileTheAdjustmentRuns )
+{
+  auto manager = std::make_shared<AdjustableOffsetManager>(
+      node_, std::nullopt, std::nullopt, std::make_optional( [] { return false; } ) );
+  manager->set_run_in_control_loop( []( const std::function<void()> &adjustment ) {
+    g_adjusting = true;
+    adjustment();
+    g_adjusting = false;
+    return true;
+  } );
+  auto flippable = std::make_shared<MockAdjustableOffset>();
+  auto unmeasurable = std::make_shared<MockAdjustableOffset>();
+  auto overflowing = std::make_shared<MockAdjustableOffset>();
+  EXPECT_CALL( *flippable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *flippable, adjustOffset( testing::_ ) ).Times( 1 );
+  EXPECT_CALL( *unmeasurable, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  EXPECT_CALL( *overflowing, getOffset() ).WillRepeatedly( Return( 0.0 ) );
+  manager->add_managed_joint( "flippable", managed( flippable ) );
+  manager->add_managed_joint( "no_handle", AdjustableOffsetManager::ManagedJoint{} );
+  manager->add_managed_joint(
+      "unmeasurable", { unmeasurable, [] { return std::numeric_limits<double>::quiet_NaN(); } } );
+  manager->add_managed_joint( "overflowing", { overflowing, [] { return -1e308; } } );
+
+  auto adjust =
+      rtest::findService<AdjustTransmissionOffsets>( node_, "~/adjust_transmission_offsets" );
+  auto flip = rtest::findService<FlipByPi>( node_, "~/flip_by_pi" );
+  ASSERT_TRUE( adjust && flip );
+  EXPECT_CALL( *adjust, send_response( testing::_, testing::_ ) );
+  EXPECT_CALL( *flip, send_response( testing::_, testing::_ ) );
+  auto adjust_request = measure( { "no_handle", "unmeasurable" }, 1.5 );
+  adjust_request->external_joint_measurements.name.push_back( "nan" );
+  adjust_request->external_joint_measurements.position.push_back(
+      std::numeric_limits<double>::quiet_NaN() );
+  adjust_request->external_joint_measurements.name.push_back( "overflowing" );
+  adjust_request->external_joint_measurements.position.push_back( 1e308 );
+  auto flip_request = std::make_shared<FlipByPi::Request>();
+  flip_request->joint_names = { "flippable", "no_handle", "ghost" };
+
+  g_logged.clear();
+  g_logged_while_adjusting.clear();
+  const auto previous_handler = rcutils_logging_get_output_handler();
+  rcutils_logging_set_output_handler( record_log );
+  adjust->handle_request( std::make_shared<rmw_request_id_t>(), adjust_request );
+  flip->handle_request( std::make_shared<rmw_request_id_t>(), flip_request );
+  rcutils_logging_set_output_handler( previous_handler );
+
+  EXPECT_TRUE( g_logged_while_adjusting.empty() ) << joined( g_logged_while_adjusting );
+  const std::string logged = joined( g_logged );
+  for ( const std::string expected :
+        { "WARN Received NaN for joint nan", "WARN Joint 'no_handle' has no offset handle registered",
+          "ERROR Joint 'unmeasurable' has no usable position",
+          "ERROR Joint 'overflowing' would get the offset inf",
+          "INFO Flipped joint 'flippable' by pi", "WARN Joint 'ghost' not found" } ) {
+    EXPECT_THAT( logged, testing::HasSubstr( expected ) );
+  }
+  EXPECT_EQ( std::count( g_logged.begin(), g_logged.end(), "WARN Post-callback returned false." ), 2 );
 }

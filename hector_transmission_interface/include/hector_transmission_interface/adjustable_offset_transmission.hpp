@@ -6,36 +6,163 @@
 #define DYNAMIC_OFFSET_TRANSMISSION_HPP
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
+#include <thread>
 #include <transmission_interface/simple_transmission.hpp>
 #include <utility>
 #include <vector>
 
 namespace hector_transmission_interface
 {
+/**
+ * \brief The offset of one joint, and the state of the 2pi jump detector that maintains it.
+ *
+ * A joint is served by two transmissions - one bound to its present values, one to its goals -
+ * and they must agree on the offset at every instant, so the offset lives here and both hold a
+ * pointer to it. Persisted to ~/.ros/dynamic_offset_transmissions/<joint>.txt by a writer thread
+ * of its own, because a change can come from the control loop, which must not wait for a disk.
+ */
+class JointOffset
+{
+public:
+  explicit JointOffset( const std::string &joint_name, double initial_offset );
+  ~JointOffset();
+  JointOffset( const JointOffset & ) = delete;
+  JointOffset &operator=( const JointOffset & ) = delete;
+
+  /// Wait until every change so far is on disk, or failed to get there.
+  void flush();
+
+  double value() const { return offset_; }
+  void set( double offset );
+
+  /**
+   * \brief Feed one present actuator position to the jump detector.
+   *
+   * When a Dynamixel actuator loses power it comes back reporting its absolute position within a
+   * single turn, i.e. the position it had shifted by a multiple of 2pi. Such a shift since the
+   * previous reading is absorbed into the offset, so the joint position stays where it was.
+   *
+   * With a reset window set, only a shift that lands the reading inside the window counts: any
+   * other multiple of 2pi is a real move and is reported, not corrected. Without a window every
+   * multiple of 2pi is taken for a reset.
+   * @return the number of 2pi turns corrected (0 if nothing happened)
+   */
+  int observeActuatorPosition( double actuator_position, double reduction );
+
+  /**
+   * \brief The interval a power cycle can leave this actuator's position in, in actuator radians.
+   *
+   * A window narrower than 2pi admits at most one of the candidate shifts, one of 3pi at most two.
+   * The caller decides how tightly it can bound the interval; anything under 4pi rejects some
+   * candidate and is worth setting.
+   */
+  void setResetWindow( double lower, double upper )
+  {
+    if ( !( lower < upper ) ) {
+      // An empty window admits no candidate, so every correction is silently dropped while the
+      // detector goes on warning about each jump it found and could not act on.
+      throw transmission_interface::Exception(
+          "The boot position window of joint '" + joint_name_ + "' is empty (lower " +
+          std::to_string( lower ) + " is not below upper " + std::to_string( upper ) + ")." );
+    }
+    reset_window_ = std::make_pair( lower, upper );
+  }
+  const std::optional<std::pair<double, double>> &resetWindow() const { return reset_window_; }
+
+  /// Restart the detector from this position: a deliberate offset change is not a jump.
+  /// A non-finite position is not recorded, keeping the baseline finite for the jump arithmetic.
+  void rebaseDetector( double actuator_position )
+  {
+    if ( std::isfinite( actuator_position ) ) {
+      prev_actuator_position_ = actuator_position;
+    }
+  }
+
+  int correctionCount() const { return correction_count_; }
+  const std::string &jointName() const { return joint_name_; }
+
+private:
+  bool existsTransmissionOffsetFile() const;
+  void loadTransmissionOffset();
+  void saveTransmissionOffset( double offset ) const;
+  /// Hand the current offset to the writer thread, without waiting for it.
+  void requestSave();
+  void writerLoop();
+
+  std::string joint_name_;
+  std::filesystem::path transmission_file_path_;
+  double offset_;
+  std::optional<double> prev_actuator_position_;
+  std::optional<std::pair<double, double>> reset_window_;
+  int correction_count_{ 0 };
+
+  std::atomic<double> offset_to_save_{ 0.0 };
+  std::atomic<uint64_t> saves_requested_{ 0 };
+  uint64_t saves_done_{ 0 };
+  bool stop_writer_{ false };
+  std::mutex writer_mutex_;
+  std::condition_variable writer_cv_;
+  std::condition_variable saved_cv_;
+  std::thread writer_;
+
+  /// The number of turns a power cycle would have shifted the previous reading by, if any.
+  std::optional<int> turnsOfAReset( double previous, double current ) const;
+
+  static constexpr double TWO_PI = 2.0 * M_PI;
+  // Tolerance for detecting a 2pi jump (allow ~10% margin)
+  static constexpr double JUMP_TOLERANCE = 0.2 * M_PI;
+  /// Largest turn count a power cycle can plausibly shift a reading by.
+  static constexpr double MAX_RESET_TURNS = 1e6;
+};
+
 class AdjustableOffsetTransmission : public transmission_interface::SimpleTransmission
 {
 public:
-  using OffsetCorrectionCallback = std::function<void( double new_offset )>;
+  /**
+   * Which of a joint's two transmissions this is. Only the one bound to the PRESENT values sees
+   * real actuator readings, so only it feeds the jump detector; the one bound to the goals just
+   * maps with whatever offset the joint has.
+   */
+  enum class Side { State, Command };
 
+  /// A transmission owning a fresh JointOffset for the joint: the state side of a lone instance.
   explicit AdjustableOffsetTransmission( const std::string &joint_name,
                                          double joint_to_actuator_reduction,
                                          double joint_offset = 0.0, bool pass_through_effort = false,
                                          std::vector<std::string> pass_through_interfaces = {} );
+
+  /// One of the two transmissions sharing a joint's offset.
+  AdjustableOffsetTransmission( std::shared_ptr<JointOffset> offset, Side side,
+                                double joint_to_actuator_reduction, bool pass_through_effort = false,
+                                std::vector<std::string> pass_through_interfaces = {} );
+
   /***
    * \brief
    * Adjusts the transmission offset for the joint.
-   * This will also save the new offset to the file system.
+   * This also queues the new offset for the file system (see JointOffset::flush()).
    * WARNING: MAKE SURE TO DEACTIVATE THE CONTROLLER BEFORE CHANGING THE OFFSET!
    * @param offset The new offset to set for the joint.
    */
   void adjustTransmissionOffset( double offset );
+
+  /// The joint's offset. Hides SimpleTransmission's copy, which is only a cache of this.
+  double get_joint_offset() const { return offset_->value(); }
+  const std::shared_ptr<JointOffset> &jointOffset() const { return offset_; }
+  Side side() const { return side_; }
 
   /**
    * \brief Override configure to optionally route effort/torque/force and arbitrary
@@ -51,14 +178,10 @@ public:
                   const std::vector<transmission_interface::ActuatorHandle> &actuator_handles ) override;
 
   /**
-   * \brief Override actuator_to_joint to detect and correct 2pi jumps on the actuator side.
+   * \brief Map actuator to joint values with the joint's offset.
    *
-   * When a Dynamixel actuator briefly loses power, it can lose its absolute position
-   * and reset by a multiple of 2pi. On the joint side (with a transmission ratio),
-   * this manifests as a jump of 2pi/reduction. This method detects such jumps
-   * and compensates by adjusting the joint offset.
-   *
-   * Also identity-copies any passthrough interfaces from actuator to joint side.
+   * On the state side the actuator position is first shown to the jump detector, which may
+   * change the offset. Also identity-copies any passthrough interfaces from actuator to joint.
    */
   void actuator_to_joint() override;
 
@@ -69,33 +192,16 @@ public:
   void joint_to_actuator() override;
 
   /**
-   * \brief Returns the number of 2pi corrections applied since construction (for diagnostics).
+   * \brief Returns the number of 2pi corrections applied to this joint's offset (for diagnostics).
    */
-  int getCorrectionCount() const { return correction_count_; }
-
-  /**
-   * \brief Register a callback that is invoked when a 2pi jump correction is applied.
-   *
-   * The callback receives the corrected offset value. This is used by the
-   * AdjustableOffsetManager to automatically synchronize the command transmission.
-   */
-  void setOffsetCorrectionCallback( OffsetCorrectionCallback callback )
-  {
-    offset_correction_callback_ = std::move( callback );
-  }
+  int getCorrectionCount() const { return offset_->correctionCount(); }
 
 private:
-  bool existsTransmissionOffsetFile() const;
-  void loadTransmissionOffset();
-  void saveTransmissionOffset() const;
+  /// SimpleTransmission computes with its own jnt_offset_; refresh it from the shared value.
+  void syncBaseOffset() { jnt_offset_ = offset_->value(); }
 
-  std::string joint_name_;
-  std::filesystem::path transmission_file_path_;
-
-  // 2pi jump detection state
-  std::optional<double> prev_actuator_position_;
-  int correction_count_{ 0 };
-  OffsetCorrectionCallback offset_correction_callback_;
+  std::shared_ptr<JointOffset> offset_;
+  Side side_;
 
   // Passthrough configuration
   bool pass_through_effort_;
@@ -104,119 +210,280 @@ private:
   // should be identity-copied in both directions instead of being scaled by reduction.
   std::vector<std::pair<transmission_interface::JointHandle, transmission_interface::ActuatorHandle>>
       passthrough_pairs_;
-
-  static constexpr double TWO_PI = 2.0 * M_PI;
-  // Tolerance for detecting a 2pi jump (allow ~10% margin)
-  static constexpr double JUMP_TOLERANCE = 0.2 * M_PI;
 };
 
-inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
-    const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset,
-    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
-    : SimpleTransmission( joint_to_actuator_reduction, joint_offset ), joint_name_( joint_name ),
-      pass_through_effort_( pass_through_effort ),
-      pass_through_interface_names_( std::move( pass_through_interfaces ) )
+// ---------------------------------------------------------------------------------------------
+// JointOffset
+
+inline JointOffset::JointOffset( const std::string &joint_name, double initial_offset )
+    : joint_name_( joint_name ), offset_( initial_offset )
 {
-  // path is ~/.ros/dynamic_offset_transmissions/ + joint_name + ".yaml"
-  transmission_file_path_ = std::filesystem::path( std::getenv( "HOME" ) ) / ".ros" /
+  const char *home = std::getenv( "HOME" );
+  if ( home == nullptr ) {
+    // Constructing a path from nullptr is undefined, and a robot brought up by systemd routinely
+    // has no HOME. Refusing here is the only place that can still say why.
+    throw transmission_interface::Exception(
+        "HOME is not set, so the offset of joint '" +
+        joint_name + "' has nowhere to be stored. An offset that cannot be persisted is lost on every restart." );
+  }
+  transmission_file_path_ = std::filesystem::path( home ) / ".ros" /
                             "dynamic_offset_transmissions" / ( joint_name + ".txt" );
-  const auto old_offset = get_joint_offset();
   if ( existsTransmissionOffsetFile() ) {
     loadTransmissionOffset();
   } else {
-    saveTransmissionOffset(); // save the initial offset to file
+    saveTransmissionOffset( offset_ ); // save the initial offset to file
   }
-  if ( old_offset != get_joint_offset() ) {
+  writer_ = std::thread( [this] { writerLoop(); } );
+  if ( initial_offset != offset_ ) {
     RCLCPP_INFO( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                  "Loaded transmission offset for joint '%s': %f from file %s", joint_name_.c_str(),
-                 get_joint_offset(), transmission_file_path_.c_str() );
+                 offset_, transmission_file_path_.c_str() );
   }
 }
 
-inline bool AdjustableOffsetTransmission::existsTransmissionOffsetFile() const
+inline JointOffset::~JointOffset()
+{
+  {
+    std::lock_guard<std::mutex> lock( writer_mutex_ );
+    stop_writer_ = true;
+  }
+  writer_cv_.notify_one();
+  writer_.join();
+}
+
+inline void JointOffset::requestSave()
+{
+  offset_to_save_.store( offset_ );
+  saves_requested_.fetch_add( 1 );
+  writer_cv_.notify_one();
+}
+
+inline void JointOffset::writerLoop()
+{
+  std::unique_lock<std::mutex> lock( writer_mutex_ );
+  while ( true ) {
+    // Woken by requestSave(), which does not take the lock, so a missed wake costs one period
+    writer_cv_.wait_for( lock, std::chrono::milliseconds( 100 ),
+                         [this] { return stop_writer_ || saves_requested_.load() != saves_done_; } );
+    const uint64_t requested = saves_requested_.load();
+    if ( requested != saves_done_ ) {
+      const double offset = offset_to_save_.load();
+      lock.unlock();
+      saveTransmissionOffset( offset );
+      lock.lock();
+      saves_done_ = requested;
+      saved_cv_.notify_all();
+    }
+    if ( stop_writer_ && saves_requested_.load() == saves_done_ ) {
+      return;
+    }
+  }
+}
+
+inline void JointOffset::flush()
+{
+  std::unique_lock<std::mutex> lock( writer_mutex_ );
+  const uint64_t requested = saves_requested_.load();
+  writer_cv_.notify_one();
+  saved_cv_.wait( lock, [this, requested] { return saves_done_ >= requested; } );
+}
+
+inline void JointOffset::set( double offset )
+{
+  if ( !std::isfinite( offset ) ) {
+    // Every joint position is computed from this, and it would be persisted for the next boot too.
+    RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                  "Refusing a non-finite offset for joint '%s'.", joint_name_.c_str() );
+    return;
+  }
+  offset_ = offset;
+  requestSave();
+}
+
+inline std::optional<int> JointOffset::turnsOfAReset( double previous, double current ) const
+{
+  const double delta = current - previous;
+  const double turns = std::round( delta / TWO_PI );
+  // A turn count that does not fit an int is undefined to convert, and no actuator reset is that
+  // far away. MAX_RESET_TURNS is far above any real one and far below where the cast breaks.
+  if ( std::abs( turns ) > MAX_RESET_TURNS ) {
+    return std::nullopt;
+  }
+  const int n_turns = static_cast<int>( turns );
+  if ( n_turns == 0 || std::abs( delta - n_turns * TWO_PI ) >= JUMP_TOLERANCE ) {
+    return std::nullopt; // not a whole number of turns apart
+  }
+  if ( !reset_window_ ) {
+    return n_turns;
+  }
+  // A power cycle reports the previous position wrapped into the window, so the readings it could
+  // produce are the ones congruent to previous that lie there: one value for a window a single turn
+  // wide, two for the union of a signed and an unsigned turn. Asking only whether current falls in
+  // the window would also admit everything between those values, which on a wider window is most of
+  // a turn of real movement. The tolerance is the slop the delta test above already allowed, so a
+  // candidate is not missed for measurement noise.
+  const auto &[lower, upper] = *reset_window_;
+  for ( double candidate = previous - TWO_PI * std::floor( ( previous - lower ) / TWO_PI );
+        candidate < upper; candidate += TWO_PI ) {
+    if ( std::abs( current - candidate ) < JUMP_TOLERANCE ) {
+      return n_turns;
+    }
+  }
+  RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+               "Actuator of joint '%s' moved %d x 2pi between two readings (%.4f -> %.4f rad) "
+               "without landing where a power cycle puts it ([%.4f, %.4f)). Treated as a real "
+               "move, not corrected.",
+               joint_name_.c_str(), n_turns, previous, current, lower, upper );
+  return std::nullopt;
+}
+
+inline int JointOffset::observeActuatorPosition( double actuator_position, double reduction )
+{
+  if ( !std::isfinite( actuator_position ) || !std::isfinite( reduction ) || reduction == 0.0 ) {
+    // Rounding a non-finite delta to a turn count is undefined, and the jump test cannot reject it
+    // either: every comparison against NaN is false. A reduction that is not a real number turns
+    // any correction it does compute into a non-finite offset. Nothing is recorded, so the next
+    // real reading becomes the baseline.
+    return 0;
+  }
+  int n_jumps = 0;
+  if ( prev_actuator_position_.has_value() ) {
+    if ( const auto turns = turnsOfAReset( *prev_actuator_position_, actuator_position ) ) {
+      n_jumps = *turns;
+      // The jump in joint space is n_jumps * 2pi / reduction; absorb it into the offset.
+      offset_ -= n_jumps * TWO_PI / reduction;
+      correction_count_ += std::abs( n_jumps );
+      requestSave();
+      RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
+                   "Detected %d x 2pi actuator position jump on joint '%s' "
+                   "(actuator delta: %.4f rad). Corrected offset to %.6f.",
+                   n_jumps, joint_name_.c_str(), actuator_position - *prev_actuator_position_,
+                   offset_ );
+    }
+  }
+  prev_actuator_position_ = actuator_position;
+  return n_jumps;
+}
+
+inline bool JointOffset::existsTransmissionOffsetFile() const
 {
   return std::filesystem::exists( transmission_file_path_ );
 }
 
-inline void AdjustableOffsetTransmission::loadTransmissionOffset()
+inline void JointOffset::loadTransmissionOffset()
 {
-  // Load the transmission offset from the specified storage path
-  if ( std::filesystem::exists( transmission_file_path_ ) ) {
-    std::ifstream file( transmission_file_path_ );
-    if ( file.is_open() ) {
-      double offset;
-      file >> offset;
-      if ( file.fail() || !file.eof() ) {
-        RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                      "Failed to read a valid offset from file: %s",
-                      transmission_file_path_.string().c_str() );
-      } else {
-        jnt_offset_ = offset;
-      }
-      file.close();
-    } else {
-      RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                    "Failed to open transmission offset file: %s",
-                    transmission_file_path_.string().c_str() );
-    }
-  } else {
-    RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                 "Transmission offset file does not exist: %s",
+  const auto logger = rclcpp::get_logger( "AdjustableOffsetTransmission" );
+  if ( !std::filesystem::exists( transmission_file_path_ ) ) {
+    RCLCPP_WARN( logger, "Transmission offset file does not exist: %s",
                  transmission_file_path_.string().c_str() );
+    return;
+  }
+  std::ifstream file( transmission_file_path_ );
+  if ( !file.is_open() ) {
+    RCLCPP_ERROR( logger, "Failed to open transmission offset file: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+
+  double offset;
+  file >> offset;
+  // Tested before the scan below, which drives the stream to eof: an extraction that failed on a
+  // truncated or empty file also ends there, so failbit only tells the two apart now.
+  if ( file.fail() ) {
+    RCLCPP_ERROR( logger, "Transmission offset file holds no number: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+  // Extraction stops at the newline without setting eofbit, so requiring eof rejects every file
+  // that ends in one - which is every file written by an editor or by echo. What must be rejected
+  // is trailing content, so the check is for anything that is not whitespace.
+  bool trailing_content = false;
+  for ( char c = 0; file.get( c ); ) {
+    if ( std::isspace( static_cast<unsigned char>( c ) ) == 0 ) {
+      trailing_content = true;
+      break;
+    }
+  }
+  if ( file.bad() || trailing_content || !std::isfinite( offset ) ) {
+    RCLCPP_ERROR( logger, "Failed to read a valid offset from file: %s",
+                  transmission_file_path_.string().c_str() );
+    return;
+  }
+  offset_ = offset;
+}
+
+inline void JointOffset::saveTransmissionOffset( double offset ) const
+{
+  const auto logger = rclcpp::get_logger( "AdjustableOffsetTransmission" );
+  std::error_code error;
+  std::filesystem::create_directories( transmission_file_path_.parent_path(), error );
+  if ( error ) {
+    // Reported rather than thrown: this runs on the writer thread, and an exception out of it
+    // takes the process with it.
+    RCLCPP_ERROR( logger, "Failed to create the directory for %s: %s",
+                  transmission_file_path_.string().c_str(), error.message().c_str() );
+    return;
+  }
+
+  // Written beside the target and renamed onto it. A crash or a full disk partway through leaves
+  // the previous offset in place instead of the empty or half-written file that a direct write
+  // would leave, which the loader cannot tell from a good one.
+  std::filesystem::path temp_path = transmission_file_path_;
+  temp_path += ".tmp";
+  {
+    std::ofstream file( temp_path );
+    if ( !file.is_open() ) {
+      RCLCPP_ERROR( logger, "Failed to open transmission offset file for writing: %s",
+                    temp_path.string().c_str() );
+      return;
+    }
+    // Enough digits that loading gives back the offset that was saved. The stream default is six
+    // significant digits, which loses roughly 1e-5 rad per save/load cycle on a multi-turn offset.
+    file << std::setprecision( std::numeric_limits<double>::max_digits10 ) << offset;
+    file.close();
+    // After close(), which is where a deferred flush failure (a full disk) surfaces.
+    if ( file.fail() ) {
+      RCLCPP_ERROR( logger, "Failed to write offset to file: %s", temp_path.string().c_str() );
+      std::filesystem::remove( temp_path, error );
+      return;
+    }
+  }
+
+  std::filesystem::rename( temp_path, transmission_file_path_, error );
+  if ( error ) {
+    RCLCPP_ERROR( logger, "Failed to move the new offset onto %s: %s",
+                  transmission_file_path_.string().c_str(), error.message().c_str() );
+    std::filesystem::remove( temp_path, error );
   }
 }
 
-inline void AdjustableOffsetTransmission::saveTransmissionOffset() const
+// ---------------------------------------------------------------------------------------------
+// AdjustableOffsetTransmission
+
+inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
+    const std::string &joint_name, double joint_to_actuator_reduction, double joint_offset,
+    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
+    : AdjustableOffsetTransmission( std::make_shared<JointOffset>( joint_name, joint_offset ),
+                                    Side::State, joint_to_actuator_reduction, pass_through_effort,
+                                    std::move( pass_through_interfaces ) )
 {
-  // Save the current transmission offset to the specified storage path
-  std::filesystem::create_directories( transmission_file_path_.parent_path() );
-  std::ofstream file( transmission_file_path_ );
-  if ( file.is_open() ) {
-    file << jnt_offset_;
-    if ( file.fail() ) {
-      RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                    "Failed to write offset to file: %s", transmission_file_path_.string().c_str() );
-    }
-    file.close();
-  } else {
-    RCLCPP_ERROR( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                  "Failed to open transmission offset file for writing: %s",
-                  transmission_file_path_.string().c_str() );
-  }
+}
+
+inline AdjustableOffsetTransmission::AdjustableOffsetTransmission(
+    std::shared_ptr<JointOffset> offset, Side side, double joint_to_actuator_reduction,
+    bool pass_through_effort, std::vector<std::string> pass_through_interfaces )
+    : SimpleTransmission( joint_to_actuator_reduction, offset->value() ),
+      offset_( std::move( offset ) ), side_( side ), pass_through_effort_( pass_through_effort ),
+      pass_through_interface_names_( std::move( pass_through_interfaces ) )
+{
 }
 
 inline void AdjustableOffsetTransmission::actuator_to_joint()
 {
-  // Read the current actuator position before the base transform
-  if ( actuator_position_ && prev_actuator_position_.has_value() ) {
-    double current_actuator_pos = actuator_position_.get_value();
-    double delta = current_actuator_pos - prev_actuator_position_.value();
-
-    // Check if the jump is close to a multiple of 2pi
-    // Round to nearest integer multiple of 2pi
-    double n_jumps_raw = delta / TWO_PI;
-    int n_jumps = static_cast<int>( std::round( n_jumps_raw ) );
-
-    if ( n_jumps != 0 && std::abs( delta - n_jumps * TWO_PI ) < JUMP_TOLERANCE ) {
-      // Detected a 2pi jump on the actuator side.
-      // Compensate in the joint offset: the jump in joint space is n_jumps * 2pi / reduction
-      double joint_space_correction = n_jumps * TWO_PI / reduction_;
-      jnt_offset_ -= joint_space_correction;
-      correction_count_ += std::abs( n_jumps );
-      saveTransmissionOffset();
-
-      RCLCPP_WARN( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
-                   "Detected %d x 2pi actuator position jump on joint '%s' "
-                   "(actuator delta: %.4f rad). Corrected offset to %.6f.",
-                   n_jumps, joint_name_.c_str(), delta, jnt_offset_ );
-
-      if ( offset_correction_callback_ ) {
-        offset_correction_callback_( jnt_offset_ );
-      }
-    }
+  if ( side_ == Side::State && actuator_position_ ) {
+    offset_->observeActuatorPosition( actuator_position_.get_value(), reduction_ );
   }
-
-  // Perform the standard transform (uses possibly-updated jnt_offset_)
+  syncBaseOffset();
   SimpleTransmission::actuator_to_joint();
 
   // Identity-copy any passthrough interfaces from actuator to joint side.
@@ -225,15 +492,11 @@ inline void AdjustableOffsetTransmission::actuator_to_joint()
       joint_handle.set_value( actuator_handle.get_value() );
     }
   }
-
-  // Track actuator position for next cycle's jump detection
-  if ( actuator_position_ ) {
-    prev_actuator_position_ = actuator_position_.get_value();
-  }
 }
 
 inline void AdjustableOffsetTransmission::joint_to_actuator()
 {
+  syncBaseOffset();
   SimpleTransmission::joint_to_actuator();
 
   // Identity-copy any passthrough interfaces from joint to actuator side.
@@ -297,13 +560,13 @@ inline void AdjustableOffsetTransmission::configure(
       RCLCPP_DEBUG( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Passthrough joint handle '%s' on joint '%s' has no matching actuator handle; "
                     "dropping.",
-                    name.c_str(), joint_name_.c_str() );
+                    name.c_str(), offset_->jointName().c_str() );
       continue;
     }
     if ( !joint_handle || !*it ) {
       RCLCPP_DEBUG( rclcpp::get_logger( "AdjustableOffsetTransmission" ),
                     "Passthrough handle pair '%s' on joint '%s' has nullptr backing; dropping.",
-                    name.c_str(), joint_name_.c_str() );
+                    name.c_str(), offset_->jointName().c_str() );
       continue;
     }
     passthrough_pairs_.emplace_back( joint_handle, *it );
@@ -312,14 +575,12 @@ inline void AdjustableOffsetTransmission::configure(
 
 inline void AdjustableOffsetTransmission::adjustTransmissionOffset( double offset )
 {
-  jnt_offset_ = offset;
-  saveTransmissionOffset();
-  actuator_to_joint(); // update joint state based on new offset
-
-  // Reset jump detection to avoid false positive after manual offset change
-  if ( actuator_position_ ) {
-    prev_actuator_position_ = actuator_position_.get_value();
+  offset_->set( offset );
+  // A deliberate change is not a jump: whatever the state side reads next is the new baseline.
+  if ( side_ == Side::State && actuator_position_ ) {
+    offset_->rebaseDetector( actuator_position_.get_value() );
   }
+  actuator_to_joint(); // update the joint side with the new offset
 }
 } // namespace hector_transmission_interface
 #endif // DYNAMIC_OFFSET_TRANSMISSION_HPP

@@ -3,9 +3,11 @@
 //
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <hector_transmission_interface/adjustable_offset_transmission.hpp>
+#include <sys/stat.h>
 
 using namespace hector_transmission_interface;
 
@@ -17,22 +19,29 @@ protected:
   std::filesystem::path offset_file_1;
   std::filesystem::path offset_file_2;
 
+  std::string test_home_;
+  const char *original_home_ = nullptr;
+
   void SetUp() override
   {
-    offset_file_1 = std::filesystem::path( std::getenv( "HOME" ) ) /
-                    ".ros/dynamic_offset_transmissions" / ( joint_name + ".txt" );
-    // Clean before each test
-    std::filesystem::remove( offset_file_1 );
-    offset_file_2 = std::filesystem::path( std::getenv( "HOME" ) ) /
-                    ".ros/dynamic_offset_transmissions" / ( secondary_joint_name + ".txt" );
-    // Clean before each test
-    std::filesystem::remove( offset_file_2 );
+    // Offsets are stored under HOME, so without this the suite reads and writes the developer's
+    // own ~/.ros and a leftover file from a real robot session decides what a test sees.
+    char dir_template[] = "/tmp/transmission_test_home_XXXXXX";
+    test_home_ = mkdtemp( dir_template );
+    original_home_ = std::getenv( "HOME" );
+    setenv( "HOME", test_home_.c_str(), 1 );
+
+    offset_file_1 = std::filesystem::path( test_home_ ) / ".ros/dynamic_offset_transmissions" /
+                    ( joint_name + ".txt" );
+    offset_file_2 = std::filesystem::path( test_home_ ) / ".ros/dynamic_offset_transmissions" /
+                    ( secondary_joint_name + ".txt" );
   }
 
   void TearDown() override
   {
-    std::filesystem::remove( offset_file_1 );
-    std::filesystem::remove( offset_file_2 );
+    if ( original_home_ != nullptr )
+      setenv( "HOME", original_home_, 1 );
+    std::filesystem::remove_all( test_home_ );
   }
 
   bool fileContainsValue( double expected, double tolerance = 1e-6 )
@@ -80,6 +89,7 @@ TEST_F( AdjustableOffsetTransmissionTest, LoadAndSaveOffset )
   // 2) Adjust offset and check file was updated
   trans.adjustTransmissionOffset( 0.456 );
   EXPECT_NEAR( trans.get_joint_offset(), 0.456, 1e-9 );
+  trans.jointOffset()->flush();
   EXPECT_TRUE( fileContainsValue( 0.456 ) );
 
   // 3) Reload new instance from file, check offset persists
@@ -212,6 +222,7 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_OffsetPersistedToDisk )
   EXPECT_NEAR( trans.get_joint_offset(), expected_offset, 1e-9 );
 
   // Verify persistence: reload from file
+  trans.jointOffset()->flush();
   AdjustableOffsetTransmission trans2( joint_name, 2.0, 0.0 );
   EXPECT_NEAR( trans2.get_joint_offset(), expected_offset, 1e-4 );
 }
@@ -245,9 +256,154 @@ TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_NoCorrectionAfterManualA
   // This internally calls actuator_to_joint() and resets prev_actuator_position_
   trans.adjustTransmissionOffset( 5.0 );
 
-  // Now simulate a read with the same actuator position — no jump should be detected
+  // The actuator has to move for there to be anything to detect: reading the same position twice
+  // reports no jump whether or not the adjustment rebased the detector, which is what let this
+  // test pass with the rebase removed.
+  actuator_pos = 1.2;
   trans.actuator_to_joint();
-  EXPECT_EQ( trans.getCorrectionCount(), 0 );
+  EXPECT_EQ( trans.getCorrectionCount(), 0 )
+      << "An ordinary movement after a calibration was mistaken for a jump.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, OffsetFileWithATrailingNewlineIsAccepted )
+{
+  // Every editor and every shell redirection ends a file with a newline. Extraction stops at it
+  // without setting eofbit, so a strict "must be at eof" check throws the offset away and the
+  // joint silently comes up on the one from the URDF instead.
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << "3.14\n";
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 3.14, 1e-9 )
+      << "A file ending in a newline was rejected, so the persisted offset was lost.";
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, OffsetFileWithTrailingContentIsRejected )
+{
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << "3.14 garbage";
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 1.5, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 1.5, 1e-9 )
+      << "A file carrying more than an offset was read as one anyway.";
+}
+
+// A crash between truncating the offset file and writing it leaves one of these behind. Reading any
+// of them as an offset moves the joint by whole turns on the next boot, and the jump detector then
+// persists what it read.
+class TruncatedOffsetFileTest : public AdjustableOffsetTransmissionTest,
+                                public ::testing::WithParamInterface<std::string>
+{
+};
+
+TEST_P( TruncatedOffsetFileTest, TheConfiguredOffsetSurvivesAnUnreadableFile )
+{
+  std::filesystem::create_directories( offset_file_1.parent_path() );
+  {
+    std::ofstream file( offset_file_1 );
+    file << GetParam();
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto trans = createConfiguredTransmission( joint_name, 2.0, 1.5, actuator_pos, joint_pos );
+  EXPECT_NEAR( trans.get_joint_offset(), 1.5, 1e-9 )
+      << "A file holding '" << GetParam() << "' was accepted as an offset.";
+}
+
+// "1e400" is the one that overflows rather than truncates: extraction clamps it to DBL_MAX and
+// reports the failure, so a check that does not look at failbit adopts a huge offset.
+INSTANTIATE_TEST_SUITE_P( CrashLeftovers, TruncatedOffsetFileTest,
+                          ::testing::Values( "", "\n\n", "   ", "-", "1.23e", "1e400" ) );
+
+TEST_F( AdjustableOffsetTransmissionTest, AFailedSaveLeavesThePreviousOffsetOnDisk )
+{
+  {
+    AdjustableOffsetTransmission trans( joint_name, 1.0, 0.25 );
+    ASSERT_TRUE( fileContainsValue( 0.25 ) );
+  }
+
+  // A directory where the file belongs: every open for writing fails, the way a full or read-only
+  // disk fails, without needing one.
+  std::filesystem::path blocker = offset_file_1;
+  blocker += ".tmp";
+  std::filesystem::create_directories( blocker );
+
+  AdjustableOffsetTransmission trans( joint_name, 1.0 );
+  trans.adjustTransmissionOffset( 9.75 );
+  trans.jointOffset()->flush();
+
+  EXPECT_TRUE( fileContainsValue( 0.25 ) )
+      << "A save that could not be written destroyed the offset that was already on disk.";
+}
+
+// A 2pi correction happens in the control loop, which must not wait for a disk. The save path is
+// made to block, with a FIFO where the temporary file goes, and the correction must return anyway.
+TEST_F( AdjustableOffsetTransmissionTest, ACorrectionDoesNotWaitForTheDisk )
+{
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  std::filesystem::path fifo = offset_file_1;
+  fifo += ".tmp";
+  ASSERT_EQ( mkfifo( fifo.c_str(), 0600 ), 0 );
+
+  ASSERT_EQ( offset->observeActuatorPosition( 0.4, 1.0 ), 0 );
+  auto correction = std::async( std::launch::async, [&offset] {
+    return offset->observeActuatorPosition( 0.4 + 2 * M_PI, 1.0 );
+  } );
+  const bool returned = correction.wait_for( std::chrono::seconds( 2 ) ) == std::future_status::ready;
+
+  // Unblock the writer, so the offset and the test can end either way
+  std::ifstream reader( fifo );
+  std::string ignored;
+  reader >> ignored;
+  ASSERT_TRUE( returned ) << "the correction waited for the offset file to be written";
+  EXPECT_EQ( correction.get(), 1 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, ANonFiniteReadingIsNotTakenForAJump )
+{
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  const double reduction = 2.0;
+
+  ASSERT_EQ( offset->observeActuatorPosition( 0.4, reduction ), 0 );
+  EXPECT_EQ( offset->observeActuatorPosition( std::numeric_limits<double>::quiet_NaN(), reduction ),
+             0 );
+  EXPECT_EQ( offset->correctionCount(), 0 );
+  EXPECT_NEAR( offset->value(), 0.0, 1e-9 )
+      << "A NaN reading was rounded to a turn count and absorbed into the offset.";
+
+  // The reading after it is measured against the last real position, not against the NaN.
+  EXPECT_EQ( offset->observeActuatorPosition( 0.4 + 2 * M_PI, reduction ), 1 );
+  EXPECT_NEAR( offset->value(), -2 * M_PI / reduction, 1e-9 );
+}
+
+TEST_F( AdjustableOffsetTransmissionTest, PersistedOffsetRoundTripsExactly )
+{
+  // The stream default is six significant digits, which loses about 1e-5 rad per cycle on a
+  // multi-turn offset. Saving and loading must not move the joint.
+  const double offset = 4 * M_PI + 0.123456789012345;
+  {
+    double actuator_pos = 0.0;
+    double joint_pos = 0.0;
+    auto trans = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+    trans.adjustTransmissionOffset( offset );
+  }
+
+  double actuator_pos = 0.0;
+  double joint_pos = 0.0;
+  auto reloaded = createConfiguredTransmission( joint_name, 2.0, 0.0, actuator_pos, joint_pos );
+  EXPECT_NEAR( reloaded.get_joint_offset(), offset, 1e-12 )
+      << "The offset lost precision on the way to disk and back.";
 }
 
 TEST_F( AdjustableOffsetTransmissionTest, JumpDetection_ConsecutiveJumpsHandledCorrectly )
@@ -454,4 +610,268 @@ TEST_F( AdjustableOffsetTransmissionTest, PassThroughEffort_JumpCorrectionStillW
 
   EXPECT_EQ( trans.getCorrectionCount(), 1 );
   EXPECT_NEAR( joint_pos, joint_pos_before, 1e-9 );
+}
+
+/**
+ * A joint has one state transmission (bound to the present values) and one command transmission
+ * (bound to the goal values), and one offset between them.
+ *
+ * Replays the hardware's reactivation sequence after a gap in which the actuator came back one
+ * turn away: the state side maps the fresh reading, then the goal is set to the present position
+ * and the command side maps it. Afterwards both sides must agree, else the controller's first
+ * command - seeded from the state - lands one actuator turn away from where the motor is.
+ */
+TEST_F( AdjustableOffsetTransmissionTest, StateAndCommandOffsetsAgreeAfterJumpAcrossGap )
+{
+  constexpr double reduction = 2.0;
+  double actuator_pos = 1.0, joint_pos = 0.0;
+  double actuator_goal = 1.0, joint_goal = 0.0;
+
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  auto state = std::make_shared<AdjustableOffsetTransmission>( offset, Side::State, reduction );
+  auto command = std::make_shared<AdjustableOffsetTransmission>( offset, Side::Command, reduction );
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state->configure( jh, ah );
+  }
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+    command->configure( jh, ah );
+  }
+  // Activation: read, then goal := present.
+  state->actuator_to_joint();
+  actuator_goal = actuator_pos;
+  command->actuator_to_joint();
+
+  // Gap (e-stop). The actuator comes back one turn further.
+  actuator_pos = 1.0 + 2.0 * M_PI;
+
+  // Reactivation, in the hardware's order.
+  state->actuator_to_joint();
+  actuator_goal = actuator_pos;
+  command->actuator_to_joint();
+
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( state->get_joint_offset(), command->get_joint_offset(), 1e-9 );
+
+  // What the controller does on activation: command := state. The motor must not move.
+  joint_goal = joint_pos;
+  command->joint_to_actuator();
+  EXPECT_NEAR( actuator_goal, actuator_pos, 1e-9 );
+}
+
+/**
+ * The goal trajectory is not an actuator reading. A goal that moves by one turn - say a reset to
+ * the present position after the state side absorbed a jump - is not a jump of its own.
+ */
+TEST_F( AdjustableOffsetTransmissionTest, CommandSideDoesNotRunTheJumpDetector )
+{
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  double actuator_goal = 0.0, joint_goal = 0.0;
+  AdjustableOffsetTransmission command( offset, Side::Command, 2.0 );
+  std::vector<transmission_interface::JointHandle> jh{
+      { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+  std::vector<transmission_interface::ActuatorHandle> ah{
+      { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+  command.configure( jh, ah );
+
+  command.actuator_to_joint();
+  actuator_goal = 2.0 * M_PI;
+  command.actuator_to_joint();
+
+  EXPECT_EQ( command.getCorrectionCount(), 0 );
+  EXPECT_DOUBLE_EQ( offset->value(), 0.0 );
+  EXPECT_NEAR( joint_goal, M_PI, 1e-9 );
+}
+
+/// Both sides see a service adjustment at once: there is only one number to adjust.
+TEST_F( AdjustableOffsetTransmissionTest, AdjustingEitherSideMovesBoth )
+{
+  using Side = AdjustableOffsetTransmission::Side;
+  auto offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+  double actuator_pos = 1.0, joint_pos = 0.0, actuator_goal = 1.0, joint_goal = 0.0;
+  AdjustableOffsetTransmission state( offset, Side::State, 1.0 );
+  AdjustableOffsetTransmission command( offset, Side::Command, 1.0 );
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state.configure( jh, ah );
+  }
+  {
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_goal } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_goal } };
+    command.configure( jh, ah );
+  }
+
+  state.adjustTransmissionOffset( 0.25 );
+  EXPECT_DOUBLE_EQ( command.get_joint_offset(), 0.25 );
+  joint_goal = 1.0;
+  command.joint_to_actuator();
+  EXPECT_NEAR( actuator_goal, 0.75, 1e-9 );
+
+  command.adjustTransmissionOffset( -0.5 );
+  EXPECT_DOUBLE_EQ( state.get_joint_offset(), -0.5 );
+  state.actuator_to_joint();
+  EXPECT_NEAR( joint_pos, 0.5, 1e-9 );
+  offset->flush();
+  EXPECT_TRUE( fileContainsValue( -0.5 ) );
+}
+
+/**
+ * A power cycle does not shift the position by an arbitrary number of turns: the motor comes back
+ * reporting its absolute position within one turn of its homing offset. Which turn is a matter of
+ * representation - signed puts it in [-pi, pi), unsigned in [0, 2pi) - and no datasheet says which
+ * a given model uses. The caller therefore bounds the union of the two, [-pi, 2pi) about the
+ * homing offset.
+ *
+ * A 3pi window admits at most two of the candidate shifts where an exact 2pi one admits exactly
+ * one, so a single forward turn by hand is no longer distinguishable from a power cycle. Every
+ * other multiple of 2pi still is, and an unbounded detector distinguishes none of them.
+ */
+class ResetWindowTest : public AdjustableOffsetTransmissionTest
+{
+protected:
+  static constexpr double reduction = 2.0;
+  double actuator_pos = 0.0, joint_pos = 0.0;
+  std::shared_ptr<JointOffset> offset;
+  std::unique_ptr<AdjustableOffsetTransmission> state;
+
+  /// The union window for a motor whose homing offset is `homing_offset`.
+  static std::pair<double, double> unionWindow( double homing_offset )
+  {
+    return { homing_offset - M_PI, homing_offset + 2 * M_PI };
+  }
+
+  void SetUp() override
+  {
+    AdjustableOffsetTransmissionTest::SetUp();
+    offset = std::make_shared<JointOffset>( joint_name, 0.0 );
+    const auto [lower, upper] = unionWindow( 0.0 );
+    offset->setResetWindow( lower, upper );
+    state = std::make_unique<AdjustableOffsetTransmission>(
+        offset, AdjustableOffsetTransmission::Side::State, reduction );
+    std::vector<transmission_interface::JointHandle> jh{
+        { joint_name, hardware_interface::HW_IF_POSITION, &joint_pos } };
+    std::vector<transmission_interface::ActuatorHandle> ah{
+        { "actuator", hardware_interface::HW_IF_POSITION, &actuator_pos } };
+    state->configure( jh, ah );
+  }
+
+  void TearDown() override
+  {
+    // The offset's writer thread saves into the test home until it is gone
+    state.reset();
+    offset.reset();
+    AdjustableOffsetTransmissionTest::TearDown();
+  }
+
+  void readAt( double pos )
+  {
+    actuator_pos = pos;
+    state->actuator_to_joint();
+  }
+};
+
+TEST_F( ResetWindowTest, PowerCycleFromThreeTurnsOutIsCorrected )
+{
+  readAt( 3 * 2 * M_PI + 0.4 );
+  const double joint_before = joint_pos;
+
+  readAt( 0.4 ); // what the motor reports after it powers up there
+  EXPECT_EQ( state->getCorrectionCount(), 3 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, PowerCycleWrapsIntoTheWindowNotTowardsZero )
+{
+  readAt( 2 * M_PI - 0.2 ); // just below a full turn: its absolute position is -0.2
+  const double joint_before = joint_pos;
+
+  readAt( -0.2 );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, HandTurnOfTwoTurnsIsAMove )
+{
+  readAt( 0.4 );
+  readAt( 0.4 + 2 * 2 * M_PI ); // two turns out is past the window under either representation
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * 2 * M_PI ) / reduction, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, HandTurnBackwardsIsAMove )
+{
+  // The union is not symmetric: it reaches one turn up from the homing offset but only half a turn
+  // down, so a backward turn still falls outside it.
+  readAt( 0.4 );
+  readAt( 0.4 - 2 * M_PI );
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( 0.4 - 2 * M_PI ) / reduction, 1e-9 );
+}
+
+// The price of not naming a representation per model. A signed-turn motor never reports 0.4 + 2pi
+// after a power cycle, so an exact window would call this a move - but an unsigned-turn one does,
+// and nothing readable off the motor says which this is. Correcting is the safe reading of the
+// two: it keeps the joint where it was rather than jumping it a turn.
+// What the union still cannot decide, and it is half of a turn rather than all of it. Below the
+// homing offset the signed and unsigned representations disagree - a signed motor reports the
+// reading unchanged, an unsigned one reports it a turn higher - so a forward turn by hand lands
+// exactly where a power cycle would. Correcting is the safer reading: it keeps the joint where it
+// was rather than jumping it a turn.
+TEST_F( ResetWindowTest, ForwardTurnFromBelowTheHomingOffsetIsIndistinguishable )
+{
+  readAt( -0.5 );
+  const double joint_before = joint_pos;
+  readAt( -0.5 + 2 * M_PI );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+}
+
+// Above the homing offset the two representations agree, and both leave the reading untouched. No
+// power cycle can produce a jump from there, so a forward turn by hand is decidable after all.
+TEST_F( ResetWindowTest, ForwardTurnFromAboveTheHomingOffsetIsAMove )
+{
+  readAt( 0.4 );
+  readAt( 0.4 + 2 * M_PI );
+  EXPECT_EQ( state->getCorrectionCount(), 0 );
+  EXPECT_NEAR( joint_pos, ( 0.4 + 2 * M_PI ) / reduction, 1e-9 );
+}
+
+TEST_F( ResetWindowTest, WindowFollowsTheHomingOffset )
+{
+  // 6.8 rad is past the top of an unshifted window, so no unshifted motor reports it after a power
+  // cycle - but a motor with a homing offset of 1.0 does, its window reaching 1 + 2pi.
+  const auto [lower, upper] = unionWindow( 1.0 );
+  offset->setResetWindow( lower, upper );
+  readAt( 6.8 + 2 * M_PI );
+  const double joint_before = joint_pos;
+  readAt( 6.8 );
+  EXPECT_EQ( state->getCorrectionCount(), 1 );
+  EXPECT_NEAR( joint_pos, joint_before, 1e-9 );
+
+  auto unshifted = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
+  const auto [unshifted_lower, unshifted_upper] = unionWindow( 0.0 );
+  unshifted->setResetWindow( unshifted_lower, unshifted_upper );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 6.8 + 2 * M_PI, reduction ), 0 );
+  EXPECT_EQ( unshifted->observeActuatorPosition( 6.8, reduction ), 0 );
+}
+
+TEST_F( ResetWindowTest, WithoutAWindowAnyTwoPiDeltaIsStillCorrected )
+{
+  auto bare = std::make_shared<JointOffset>( secondary_joint_name, 0.0 );
+  EXPECT_EQ( bare->observeActuatorPosition( 0.4, reduction ), 0 );
+  EXPECT_EQ( bare->observeActuatorPosition( 0.4 + 2 * M_PI, reduction ), 1 );
 }

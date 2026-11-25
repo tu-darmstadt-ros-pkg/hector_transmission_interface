@@ -14,8 +14,21 @@ namespace hector_transmission_interface
 class AdjustableOffsetTransmissionLoader : public transmission_interface::TransmissionLoader
 {
 public:
+  /// A lone transmission owning its joint's offset (the pluginlib entry point).
   std::shared_ptr<transmission_interface::Transmission>
   load( const hardware_interface::TransmissionInfo &transmission_info ) override;
+
+  struct Pair {
+    std::shared_ptr<transmission_interface::Transmission> state;
+    std::shared_ptr<transmission_interface::Transmission> command;
+    explicit operator bool() const { return state && command; }
+  };
+
+  /**
+   * rief The two transmissions a hardware interface needs for one joint - one for its present
+   * values, one for its goals - sharing a single offset. Both null on failure.
+   */
+  Pair loadPair( const hardware_interface::TransmissionInfo &transmission_info );
 };
 
 } // namespace hector_transmission_interface

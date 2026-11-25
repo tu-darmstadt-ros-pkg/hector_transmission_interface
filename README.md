@@ -2,12 +2,9 @@
 
 ![Lint, Build & Test](https://github.com/tu-darmstadt-ros-pkg/hector_transmission_interface/actions/workflows/lint_build_test.yaml/badge.svg)
 
-Here is the comprehensive, final version of the `README.md`. It combines all the technical details, the persistence
-logic, the `AdjustableOffsetManager` usage with mutex protection, and clear safety guidelines.
-
-`hector_transmission_interface` provides an **Adjustable Offset Transmission** for `ros2_control`. It is designed for
-systems where the relationship between an actuator and a joint can change during runtime (e.g., belt slip) or where the
-relationship is ambiguous upon startup (e.g., relative encoders on an actuator).
+`hector_transmission_interface` provides an **Adjustable Offset Transmission** for `ros2_control`. It is meant for
+systems where the relationship between an actuator and a joint can change at runtime (e.g., belt slip) or is
+ambiguous at startup (e.g., relative encoders on an actuator).
 
 ---
 
@@ -15,93 +12,90 @@ relationship is ambiguous upon startup (e.g., relative encoders on an actuator).
 
 ### 💾 Persistence & Ambiguity Resolution
 
-This package is critical for robots with **Relative Actuator Encoders** (e.g., motors with incremental encoders placed
+This package is meant for robots with **relative actuator encoders** (e.g., motors with incremental encoders placed
 before a high-ratio gearbox) that lack absolute joint sensing.
 
-* **The Ambiguity Problem**: If a robot is moved while powered off, the relationship between the motor's zero-point and
-  the joint's physical zero-point is lost. Standard transmissions assume the current position is "Zero" on startup,
-  leading to kinematic errors.
-* **The Solution**: This transmission loads the last known "Good" offset from
+* **The ambiguity problem**: If a robot is moved while powered off, the relationship between the motor's zero point and
+  the joint's physical zero point is lost. Standard transmissions assume the current position is zero on startup,
+  which leads to kinematic errors.
+* **The solution**: This transmission loads the last known offset from
   `~/.ros/dynamic_offset_transmissions/<joint_name>.txt` on startup. If the robot was moved while off, a quick
-  calibration (Visual, Laser, or Mechanical Jig) can be used to update the offset via service call without restarting.
+  calibration (visual, laser or a mechanical jig) updates the offset through a service call without a restart.
 
 ### 🛠 How It Works
 
-The transmission applies an offset to raw actuator data. New offsets are calculated as:
+The transmission maps `joint = actuator / reduction + offset`. A calibration sets the offset so that the joint
+position matches an external measurement:
+
+```
+new_offset = measured_position - internal_position + current_offset
+```
+
+The state and the command transmission of a joint share one offset, so they always agree.
+
+Each joint saves its offset on a writer thread of its own, so a change never waits for the disk, not even one made in
+the control loop. Call `JointOffset::flush()` (through `jointOffset()`) when you need the file to be up to date, for
+example before you read it in a test. The destructor writes whatever is still pending.
 
 ---
 
 ## 🚀 AdjustableOffsetManager
 
-The `AdjustableOffsetManager` automates joint registration and provides a standardized ROS 2 service to calibrate
-multiple joints at once.
+The `AdjustableOffsetManager` registers joints and offers two services to calibrate several joints at once,
+`~/adjust_transmission_offsets` and `~/flip_by_pi`.
 
-### 🔒 Thread Safety (Recommended)
+### 🔒 Thread Safety
 
-In `ros2_control`, the `read()`/`write()` loop (Real-Time) and ROS service callbacks (Non-RT) run in different threads.
-To avoid data corruption or "jumps" during an update, the manager uses
-`std::optional<std::reference_wrapper<std::mutex>>` to safely lock your hardware communication mutex.
+The services run on a ROS executor thread, while `read()` and `write()` map values with the offsets. An adjustment must
+not land in the middle of a read or write. The manager supports two ways to ensure that.
 
-### Integration in Hardware Interface
+1. **Run the adjustment in the control loop** (preferred). Pass a function to `set_run_in_control_loop` that hands the
+   adjustment to your `read()` and waits until it ran. It must return false only if the adjustment never ran and never
+   will. No lock is needed, and the position getters and the post-callback run in the control loop too.
+2. **Share a mutex.** Pass your hardware communication mutex to the constructor. The manager holds it during the
+   adjustment, and `read()` and `write()` must skip their cycle while it is taken.
+
+`set_may_adjust` lets the hardware refuse single joints, for example because a controller commands them and would see
+its joint jump. Refused joints are skipped and listed in the response message after `refused:`, together with the
+reason.
+
+### Integration in a Hardware Interface
 
 ```cpp
 #include "hector_transmission_interface/adjustable_offset_manager.hpp"
 
-// 1. Initialize with a reference to your Hardware Interface mutex
-// This ensures the service blocks the HW thread during the update.
-hardware_interface::CallbackReturn
-DynamixelHardwareInterface::on_configure(const rclcpp_lifecycle::State& previous_state){
-offset_manager_ = std::make_unique<AdjustableOffsetManager>(node_ptr, comm_mutex_);
-// You can additionally pass pre- and post-update callbacks if needed:
-// offset_manager_ = std::make_unique<AdjustableOffsetManager>(
-//     node_ptr, comm_mutex_, pre_update_callback, post_update_callback
-// ); // with signatures: std::function<bool()>
-...
+hardware_interface::CallbackReturn MyHardwareInterface::on_init(const hardware_interface::HardwareComponentInterfaceParams& params)
+{
+  ...
+  offset_manager_ = std::make_shared<AdjustableOffsetManager>(node_);
+  offset_manager_->set_run_in_control_loop(
+      [this](const std::function<void()>& adjustment) { return runInControlLoop(adjustment); });
+  offset_manager_->set_may_adjust([this](const std::string& joint) {
+    return isCommanded(joint) ? std::string("a controller commands it") : std::string();
+  });
+  ...
 }
 
-// 2. Register State Interfaces
-std::vector<hardware_interface::StateInterface::ConstSharedPtr> DynamixelHardwareInterface::on_export_state_interfaces()
+std::vector<hardware_interface::StateInterface::ConstSharedPtr> MyHardwareInterface::on_export_state_interfaces()
 {
-  // create state interfaces
   ...
-  // setup transmissions
-  ...
-  // register transmissions with offset manager
   for (const auto& [name, joint] : joints_) {
-    // try to register only adjustable offset transmissions
-    offset_manager_->add_joint_state_interface(name, joint.state_transmission, [&joint]() {
-      return joint.joint_state.current.at(hardware_interface::HW_IF_POSITION);
-    });
+    // Ignored unless the state transmission is an AdjustableOffsetTransmission
+    offset_manager_->add_joint_state_interface(
+        name, joint.state_transmission,
+        [&joint]() { return joint.position; },
+        joint.command_transmission);
   }
   return state_interfaces;
 }
-
-// 3. Register Command Interfaces
-std::vector<hardware_interface::CommandInterface::SharedPtr> DynamixelHardwareInterface::on_export_command_interfaces()
-{
-  // create command interfaces
-  ...
-  /// setup transmissions
-  ...
-  /// register transmissions with offset manager
-  for (const auto& [name, joint] : joints_) {
-    // try to register only adjustable offset transmissions
-    offset_manager_->add_joint_command_interface(name, joint.command_transmission);
-  }
-  return command_interfaces;
-}
-
-// 4. make sure to block the hardware thread in your read()/write() methods
-void MyHardwareInterface::read() {
-
-  std::unique_lock<std::mutex> lock(dynamixel_comm_mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) {
-    // Another operation is holding dynamixel_comm_mutex_; skipping write
-    return hardware_interface::return_type::OK;
-  }
-  ... normal read/write logic ...
- }
 ```
+
+Pass the command transmission too. It keeps its own joint goal, and the manager re-derives that goal when the offset
+changes. Without it the next `write()` moves the actuator by the offset change.
+
+With the mutex model, construct the manager with `AdjustableOffsetManager(node, comm_mutex_)` instead. Optional pre- and
+post-callbacks (`std::function<bool()>`) can be passed as well. The pre-callback runs before the mutex is taken, the
+post-callback while it is held or in the control loop.
 
 ---
 
@@ -149,16 +143,10 @@ The `AdjustableOffsetTransmission` overrides `actuator_to_joint()` to automatica
 1. On each read cycle, the actuator position delta from the previous cycle is checked.
 2. If the delta is close to a multiple of 2π (within a configurable tolerance of 0.2π), a power-glitch jump is assumed.
 3. The joint offset is adjusted by `-n × 2π / reduction` to cancel out the jump.
-4. The corrected offset is persisted to disk.
+4. The corrected offset is handed to the joint's writer thread.
 5. A warning is logged for diagnostics.
 
-### Command Transmission Synchronization
-
-The `AdjustableOffsetManager` provides a `syncCommandOffsets()` method that should be called after
-`actuator_to_joint()` in the read loop. It iterates all managed joints and, if the state transmission's offset
-differs from the command transmission's offset (i.e., an automatic correction occurred), it synchronizes the
-command transmission to match. This keeps goal positions consistent without requiring the hardware interface
-to know about the correction mechanism.
+The command transmission shares the offset, so goals follow the correction without help from the hardware interface.
 
 
 ---

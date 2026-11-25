@@ -54,8 +54,12 @@ public:
       JointData data;
       data.name = name;
       // Create transmissions. In a real robot, parameters would come from URDF/INFO.
-      data.state_transmission = std::make_shared<AdjustableOffsetTransmission>( name, 1.0, 0.0 );
-      data.command_transmission = std::make_shared<AdjustableOffsetTransmission>( name, 1.0, 0.0 );
+      using Side = AdjustableOffsetTransmission::Side;
+      auto offset = std::make_shared<JointOffset>( name, 0.0 );
+      data.state_transmission =
+          std::make_shared<AdjustableOffsetTransmission>( offset, Side::State, 1.0 );
+      data.command_transmission =
+          std::make_shared<AdjustableOffsetTransmission>( offset, Side::Command, 1.0 );
       joints_[name] = data;
     }
 
@@ -79,9 +83,10 @@ public:
     std::vector<hardware_interface::StateInterface::ConstSharedPtr> state_interfaces;
 
     for ( auto &[name, joint] : joints_ ) {
-      // Export the "Joint State" (what ROS sees)
+      // The tests drive this hardware through its helpers, never through a controller, so the
+      // exported handles only complete the interface.
       state_interfaces.emplace_back( std::make_shared<hardware_interface::StateInterface>(
-          name, hardware_interface::HW_IF_POSITION, &joint.joint_position ) );
+          name, hardware_interface::HW_IF_POSITION ) );
 
       // Configure Transmission Handles
       std::vector<transmission_interface::JointHandle> joint_handles;
@@ -100,8 +105,11 @@ public:
 
       // 4. Register State Interface with Offset Manager
       // The position_getter lambda provides the current *internal (raw)* position to the manager.
-      offset_manager_->add_joint_state_interface( name, joint.state_transmission,
-                                                  [&joint]() { return joint.joint_position; } );
+      // The command transmission goes in as well: its joint goal was computed under the old
+      // offset, and mapping it down again after an adjustment moves the actuator.
+      offset_manager_->add_joint_state_interface(
+          name, joint.state_transmission, [&joint]() { return joint.joint_position; },
+          joint.command_transmission );
     }
 
     return state_interfaces;
@@ -112,9 +120,9 @@ public:
     std::vector<hardware_interface::CommandInterface::SharedPtr> command_interfaces;
 
     for ( auto &[name, joint] : joints_ ) {
-      // Export "Joint Command" (what ROS controllers write to)
+      // Only completes the interface, see on_export_state_interfaces
       command_interfaces.emplace_back( std::make_shared<hardware_interface::CommandInterface>(
-          name, hardware_interface::HW_IF_POSITION, &joint.joint_command ) );
+          name, hardware_interface::HW_IF_POSITION ) );
 
       // Configure Transmission Handles
       std::vector<transmission_interface::JointHandle> joint_handles;
@@ -130,9 +138,6 @@ public:
       actuator_handles.push_back( actuator_handle );
 
       joint.command_transmission->configure( joint_handles, actuator_handles );
-
-      // 5. Register Command Interface with Offset Manager
-      offset_manager_->add_joint_command_interface( name, joint.command_transmission );
     }
 
     return command_interfaces;
@@ -204,6 +209,26 @@ public:
       }
     }
   }
+
+  /// @brief The goal a controller would write, in joint coordinates.
+  void set_joint_command( const std::string &joint_name, double val )
+  {
+    if ( joints_.count( joint_name ) ) {
+      joints_[joint_name].joint_command = val;
+    }
+  }
+
+  /// @brief What the last write() put on the actuator. This is what the motor is told to do.
+  double get_actuator_command( const std::string &joint_name )
+  {
+    if ( joints_.count( joint_name ) ) {
+      return joints_[joint_name].actuator_command;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  /// @brief Manually trigger the write cycle logic for testing.
+  void propagate_write() { write( rclcpp::Time(), rclcpp::Duration( 0, 0 ) ); }
 
 private:
 public: // Made public struct for simplicity in this single-header test file
